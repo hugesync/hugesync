@@ -137,7 +137,15 @@ pub async fn create_backends(
         Location::S3 { bucket, prefix } => {
             StorageBackend::s3(bucket.clone(), prefix.clone()).await?
         }
-        _ => return Err(crate::error::Error::storage("unsupported source location type")),
+        Location::Gcs { bucket, prefix } => {
+            StorageBackend::gcs(bucket.clone(), prefix.clone()).await?
+        }
+        Location::Azure { container, prefix } => {
+            StorageBackend::azure(container.clone(), prefix.clone()).await?
+        }
+        Location::Ssh { .. } => {
+            return Err(crate::error::Error::storage("SSH backend not yet implemented"))
+        }
     };
 
     let dest_backend = match dest {
@@ -145,7 +153,15 @@ pub async fn create_backends(
         Location::S3 { bucket, prefix } => {
             StorageBackend::s3(bucket.clone(), prefix.clone()).await?
         }
-        _ => return Err(crate::error::Error::storage("unsupported destination location type")),
+        Location::Gcs { bucket, prefix } => {
+            StorageBackend::gcs(bucket.clone(), prefix.clone()).await?
+        }
+        Location::Azure { container, prefix } => {
+            StorageBackend::azure(container.clone(), prefix.clone()).await?
+        }
+        Location::Ssh { .. } => {
+            return Err(crate::error::Error::storage("SSH backend not yet implemented"))
+        }
     };
 
     Ok((source_backend, dest_backend))

@@ -6,7 +6,7 @@ use crate::types::FileEntry;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
-use futures::StreamExt;
+
 use std::path::PathBuf;
 
 /// AWS S3 storage backend
@@ -64,10 +64,16 @@ impl S3Backend {
 
             for obj in output.contents() {
                 if let Some(key) = obj.key() {
+                    // Safely strip prefix, handling empty prefix case
                     let relative = if self.prefix.is_empty() {
                         key.to_string()
                     } else {
-                        key.strip_prefix(&format!("{}/", self.prefix.trim_end_matches('/')))
+                        let prefix_with_slash = format!("{}/", self.prefix.trim_end_matches('/'));
+                        key.strip_prefix(&prefix_with_slash)
+                            .or_else(|| {
+                                // Also try without trailing slash for exact prefix match
+                                key.strip_prefix(&self.prefix)
+                            })
                             .unwrap_or(key)
                             .to_string()
                     };

@@ -1,5 +1,7 @@
 //! Storage backends for HugeSync
 
+pub mod azure;
+pub mod gcs;
 pub mod local;
 pub mod s3;
 
@@ -8,6 +10,8 @@ use crate::types::FileEntry;
 use bytes::Bytes;
 use std::path::PathBuf;
 
+pub use azure::AzureBackend;
+pub use gcs::GcsBackend;
 pub use local::LocalBackend;
 pub use s3::S3Backend;
 
@@ -25,6 +29,8 @@ pub struct CompletedPart {
 pub enum StorageBackend {
     Local(LocalBackend),
     S3(S3Backend),
+    Gcs(GcsBackend),
+    Azure(AzureBackend),
 }
 
 impl StorageBackend {
@@ -38,11 +44,23 @@ impl StorageBackend {
         Ok(StorageBackend::S3(S3Backend::new(bucket, prefix).await?))
     }
 
+    /// Create a GCS backend
+    pub async fn gcs(bucket: String, prefix: String) -> Result<Self> {
+        Ok(StorageBackend::Gcs(GcsBackend::new(bucket, prefix).await?))
+    }
+
+    /// Create an Azure backend
+    pub async fn azure(container: String, prefix: String) -> Result<Self> {
+        Ok(StorageBackend::Azure(AzureBackend::new(container, prefix).await?))
+    }
+
     /// Get the name of this backend (for logging)
     pub fn name(&self) -> &'static str {
         match self {
             StorageBackend::Local(_) => "local",
             StorageBackend::S3(_) => "s3",
+            StorageBackend::Gcs(_) => "gcs",
+            StorageBackend::Azure(_) => "azure",
         }
     }
 
@@ -51,6 +69,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(b) => b.list(prefix).await,
             StorageBackend::S3(b) => b.list(prefix).await,
+            StorageBackend::Gcs(b) => b.list(prefix).await,
+            StorageBackend::Azure(b) => b.list(prefix).await,
         }
     }
 
@@ -59,6 +79,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(b) => b.head(path).await,
             StorageBackend::S3(b) => b.head(path).await,
+            StorageBackend::Gcs(b) => b.head(path).await,
+            StorageBackend::Azure(b) => b.head(path).await,
         }
     }
 
@@ -67,6 +89,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(b) => b.get(path).await,
             StorageBackend::S3(b) => b.get(path).await,
+            StorageBackend::Gcs(b) => b.get(path).await,
+            StorageBackend::Azure(b) => b.get(path).await,
         }
     }
 
@@ -75,6 +99,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(b) => b.get_range(path, start, end).await,
             StorageBackend::S3(b) => b.get_range(path, start, end).await,
+            StorageBackend::Gcs(b) => b.get_range(path, start, end).await,
+            StorageBackend::Azure(b) => b.get_range(path, start, end).await,
         }
     }
 
@@ -83,6 +109,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(b) => b.put(path, data).await,
             StorageBackend::S3(b) => b.put(path, data).await,
+            StorageBackend::Gcs(b) => b.put(path, data).await,
+            StorageBackend::Azure(b) => b.put(path, data).await,
         }
     }
 
@@ -91,6 +119,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(b) => b.delete(path).await,
             StorageBackend::S3(b) => b.delete(path).await,
+            StorageBackend::Gcs(b) => b.delete(path).await,
+            StorageBackend::Azure(b) => b.delete(path).await,
         }
     }
 
@@ -104,6 +134,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(_) => false,
             StorageBackend::S3(_) => true,
+            StorageBackend::Gcs(_) => true,  // GCS supports compose
+            StorageBackend::Azure(_) => true, // Azure supports block list
         }
     }
 
@@ -112,6 +144,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(_) => false,
             StorageBackend::S3(_) => true,
+            StorageBackend::Gcs(_) => true,  // GCS compose can copy ranges
+            StorageBackend::Azure(_) => true, // Azure can copy blocks
         }
     }
 
@@ -122,6 +156,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(_) => Err(crate::error::Error::storage("multipart not supported")),
             StorageBackend::S3(b) => b.create_multipart_upload(path).await,
+            StorageBackend::Gcs(b) => b.create_multipart_upload(path).await,
+            StorageBackend::Azure(b) => b.create_multipart_upload(path).await,
         }
     }
 
@@ -136,6 +172,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(_) => Err(crate::error::Error::storage("multipart not supported")),
             StorageBackend::S3(b) => b.upload_part(path, upload_id, part_number, data).await,
+            StorageBackend::Gcs(b) => b.upload_part(path, upload_id, part_number, data).await,
+            StorageBackend::Azure(b) => b.upload_part(path, upload_id, part_number, data).await,
         }
     }
 
@@ -155,6 +193,14 @@ impl StorageBackend {
                 b.upload_part_copy(path, upload_id, part_number, source_path, source_start, source_end)
                     .await
             }
+            StorageBackend::Gcs(b) => {
+                b.upload_part_copy(path, upload_id, part_number, source_path, source_start, source_end)
+                    .await
+            }
+            StorageBackend::Azure(b) => {
+                b.upload_part_copy(path, upload_id, part_number, source_path, source_start, source_end)
+                    .await
+            }
         }
     }
 
@@ -168,6 +214,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(_) => Err(crate::error::Error::storage("multipart not supported")),
             StorageBackend::S3(b) => b.complete_multipart_upload(path, upload_id, parts).await,
+            StorageBackend::Gcs(b) => b.complete_multipart_upload(path, upload_id, parts).await,
+            StorageBackend::Azure(b) => b.complete_multipart_upload(path, upload_id, parts).await,
         }
     }
 
@@ -176,6 +224,8 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(_) => Err(crate::error::Error::storage("multipart not supported")),
             StorageBackend::S3(b) => b.abort_multipart_upload(path, upload_id).await,
+            StorageBackend::Gcs(b) => b.abort_multipart_upload(path, upload_id).await,
+            StorageBackend::Azure(b) => b.abort_multipart_upload(path, upload_id).await,
         }
     }
 }

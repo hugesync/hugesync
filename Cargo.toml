@@ -35,10 +35,8 @@ object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
 aws-sdk-s3 = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 
-# Cloud & Network - GCP
-google-cloud-storage = "1.5"
-
-# Cloud & Network - Azure
+# Cloud & Network - Azure (Native SDK for delta support)
+azure_core = "0.21"
 azure_storage = "0.21"
 azure_storage_blobs = "0.21"
 

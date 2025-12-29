@@ -1,9 +1,10 @@
 //! Delta computation and types
 
-mod compute;
+pub mod compute;
 pub mod coalesce;
 
 pub use compute::compute_delta;
+pub use compute::compute_delta_rolling;
 pub use coalesce::coalesce_operations;
 
 use serde::{Deserialize, Serialize};

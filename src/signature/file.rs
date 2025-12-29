@@ -38,6 +38,9 @@ pub fn write_signature(sig: &Signature, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Maximum signature data size to prevent DoS (100MB)
+const MAX_SIGNATURE_SIZE: usize = 100 * 1024 * 1024;
+
 /// Read a signature from a file
 pub fn read_signature(path: &Path) -> Result<Signature> {
     let file = File::open(path).map_err(|e| Error::io("opening signature file", e))?;
@@ -76,6 +79,16 @@ pub fn read_signature(path: &Path) -> Result<Signature> {
         .read_exact(&mut len_bytes)
         .map_err(|e| Error::io("reading length", e))?;
     let len = u64::from_le_bytes(len_bytes) as usize;
+
+    // Check for unreasonable size to prevent OOM
+    if len > MAX_SIGNATURE_SIZE {
+        return Err(Error::Delta {
+            message: format!(
+                "signature data too large: {} bytes (max {})",
+                len, MAX_SIGNATURE_SIZE
+            ),
+        });
+    }
 
     // Read data
     let mut data = vec![0u8; len];
@@ -118,6 +131,16 @@ pub fn read_signature_from_bytes(data: &[u8]) -> Result<Signature> {
 
     // Read length
     let len = u64::from_le_bytes(data[7..15].try_into().unwrap()) as usize;
+
+    // Check for unreasonable size to prevent OOM
+    if len > MAX_SIGNATURE_SIZE {
+        return Err(Error::Delta {
+            message: format!(
+                "signature data too large: {} bytes (max {})",
+                len, MAX_SIGNATURE_SIZE
+            ),
+        });
+    }
 
     if data.len() < 15 + len {
         return Err(Error::Delta {

@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn test_empty_file() {
         let file = NamedTempFile::new().unwrap();
-        let sig = generate_signature(file.path(), DEFAULT_BLOCK_SIZE).unwrap();
+        let sig = generate_signature(file.path(), 5 * 1024 * 1024).unwrap();
         assert_eq!(sig.file_size, 0);
         assert!(sig.blocks.is_empty());
     }
