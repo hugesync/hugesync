@@ -1,12 +1,14 @@
 //! Local filesystem storage backend
 
 use crate::error::{Error, Result};
+use crate::storage::ByteStream;
 use crate::types::FileEntry;
 use bytes::Bytes;
+use futures::StreamExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use tokio::fs;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Local filesystem storage backend
 #[derive(Clone)]
@@ -159,6 +161,32 @@ impl LocalBackend {
             .await
             .map_err(|e| Error::io("writing file", e))?;
 
+        Ok(())
+    }
+
+    /// Write a file from a stream of chunks
+    pub async fn put_stream(&self, path: &str, mut stream: ByteStream) -> Result<()> {
+        let full_path = self.resolve(path);
+
+        // Create parent directories if needed
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Error::io("creating directories", e))?;
+        }
+
+        let mut file = fs::File::create(&full_path)
+            .await
+            .map_err(|e| Error::io("creating file", e))?;
+
+        while let Some(chunk) = stream.next().await {
+            let data = chunk?;
+            file.write_all(&data)
+                .await
+                .map_err(|e| Error::io("writing chunk", e))?;
+        }
+
+        file.flush().await.map_err(|e| Error::io("flushing file", e))?;
         Ok(())
     }
 

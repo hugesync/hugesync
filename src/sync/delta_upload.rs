@@ -14,6 +14,12 @@ use crate::storage::StorageBackend;
 use bytes::Bytes;
 use std::path::Path;
 
+/// Threshold for using multipart upload (8MB)
+const MULTIPART_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+/// Part size for multipart uploads (16MB - comfortably above S3's 5MB minimum)
+const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
+
 /// Result of a delta upload operation
 #[derive(Debug)]
 pub struct DeltaUploadResult {
@@ -200,21 +206,43 @@ async fn delta_upload_multipart(
 }
 
 /// Perform a full file upload (no delta)
+/// 
+/// Uses memory mapping and multipart uploads for large files to avoid OOM.
 async fn full_upload(
     local_path: &Path,
     remote_path: &str,
     storage: &StorageBackend,
     config: &Config,
 ) -> Result<DeltaUploadResult> {
+    let metadata = std::fs::metadata(local_path)
+        .map_err(|e| Error::io("reading file metadata", e))?;
+    let file_size = metadata.len();
+
+    // For small files, use simple put (still safe for memory)
+    if file_size < MULTIPART_THRESHOLD || !storage.supports_multipart() {
+        return full_upload_simple(local_path, remote_path, storage, config, file_size).await;
+    }
+
+    // For large files, use memory-mapped multipart upload
+    full_upload_multipart(local_path, remote_path, storage, config, file_size).await
+}
+
+/// Simple upload for small files - reads into memory
+async fn full_upload_simple(
+    local_path: &Path,
+    remote_path: &str,
+    storage: &StorageBackend,
+    config: &Config,
+    file_size: u64,
+) -> Result<DeltaUploadResult> {
     let data = std::fs::read(local_path)
         .map_err(|e| Error::io("reading local file", e))?;
-    let size = data.len() as u64;
 
     // Upload file
     storage.put(remote_path, Bytes::from(data.clone())).await?;
 
     // Generate and upload signature if file is large enough
-    if !config.no_sidecar && size >= config.delta_threshold {
+    if !config.no_sidecar && file_size >= config.delta_threshold {
         let sig = crate::signature::generate::generate_signature_from_bytes(&data, config.block_size);
         let sig_data = write_signature_to_bytes(&sig)?;
         let sig_path = format!("{}.hssig", remote_path);
@@ -222,9 +250,87 @@ async fn full_upload(
     }
 
     Ok(DeltaUploadResult {
-        bytes_transferred: size,
+        bytes_transferred: file_size,
         bytes_reused: 0,
         parts_uploaded: 1,
+        parts_copied: 0,
+    })
+}
+
+/// Multipart upload for large files - uses memory mapping to avoid OOM
+async fn full_upload_multipart(
+    local_path: &Path,
+    remote_path: &str,
+    storage: &StorageBackend,
+    config: &Config,
+    file_size: u64,
+) -> Result<DeltaUploadResult> {
+    // Memory-map the file to avoid loading it all into RAM
+    let file = std::fs::File::open(local_path)
+        .map_err(|e| Error::io("opening local file", e))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| Error::io("mmapping local file", e))?;
+
+    tracing::info!(
+        size = file_size,
+        part_size = MULTIPART_PART_SIZE,
+        "Starting multipart upload for large file"
+    );
+
+    // Start multipart upload
+    let upload_id = storage.create_multipart_upload(remote_path).await?;
+
+    let mut completed_parts = Vec::new();
+    let mut offset = 0usize;
+    let mut part_number = 1i32;
+    let total_size = mmap.len();
+
+    // Upload in chunks - only one chunk in memory at a time
+    while offset < total_size {
+        let chunk_end = std::cmp::min(offset + MULTIPART_PART_SIZE, total_size);
+        let chunk = &mmap[offset..chunk_end];
+
+        tracing::debug!(
+            part = part_number,
+            offset = offset,
+            size = chunk.len(),
+            "Uploading part"
+        );
+
+        // Copy chunk to Bytes - this is the only allocation per part
+        let chunk_bytes = Bytes::copy_from_slice(chunk);
+
+        match storage.upload_part(remote_path, &upload_id, part_number, chunk_bytes).await {
+            Ok(completed) => {
+                completed_parts.push(completed);
+            }
+            Err(e) => {
+                // Attempt to abort on failure
+                tracing::error!(error = %e, "Part upload failed, aborting multipart upload");
+                let _ = storage.abort_multipart_upload(remote_path, &upload_id).await;
+                return Err(e);
+            }
+        }
+
+        offset = chunk_end;
+        part_number += 1;
+    }
+
+    // Complete multipart upload
+    storage.complete_multipart_upload(remote_path, &upload_id, completed_parts.clone()).await?;
+
+    // Generate and upload signature if configured
+    if !config.no_sidecar && file_size >= config.delta_threshold {
+        let sig = crate::signature::generate::generate_signature_from_bytes(&mmap[..], config.block_size);
+        let sig_data = write_signature_to_bytes(&sig)?;
+        let sig_path = format!("{}.hssig", remote_path);
+        storage.put(&sig_path, Bytes::from(sig_data)).await?;
+    }
+
+    Ok(DeltaUploadResult {
+        bytes_transferred: file_size,
+        bytes_reused: 0,
+        parts_uploaded: completed_parts.len(),
         parts_copied: 0,
     })
 }
@@ -243,5 +349,17 @@ mod tests {
         };
         
         assert_eq!(result.bytes_transferred + result.bytes_reused, 10000);
+    }
+
+    #[test]
+    fn test_multipart_threshold() {
+        // Verify threshold is reasonable (8MB)
+        assert_eq!(MULTIPART_THRESHOLD, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_part_size_above_s3_minimum() {
+        // S3 minimum is 5MB, we use 16MB
+        assert!(MULTIPART_PART_SIZE >= 5 * 1024 * 1024);
     }
 }

@@ -1,13 +1,13 @@
 //! Google Cloud Storage backend using object_store crate
 
 use crate::error::{Error, Result};
-use crate::storage::CompletedPart;
+use crate::storage::{ByteStream, CompletedPart};
 use crate::types::FileEntry;
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::gcp::{GoogleCloudStorage, GoogleCloudStorageBuilder};
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
 use std::path::PathBuf;
 
 /// Google Cloud Storage backend
@@ -158,6 +158,33 @@ impl GcsBackend {
             .map_err(|e| Error::Gcs {
                 message: format!("Failed to upload object: {}", e),
             })?;
+
+        Ok(())
+    }
+
+    /// Write a file from a stream of chunks using multipart upload
+    pub async fn put_stream(
+        &self,
+        path: &str,
+        mut stream: ByteStream,
+        _size_hint: Option<u64>,
+    ) -> Result<()> {
+        let key = self.resolve_key(path);
+
+        let upload = self.store.put_multipart(&key).await.map_err(|e| Error::Gcs {
+            message: format!("Failed to start multipart upload: {}", e),
+        })?;
+
+        let mut writer = WriteMultipart::new(upload);
+
+        while let Some(chunk) = stream.next().await {
+            let data = chunk?;
+            writer.write(&data);
+        }
+
+        writer.finish().await.map_err(|e| Error::Gcs {
+            message: format!("Failed to complete multipart upload: {}", e),
+        })?;
 
         Ok(())
     }

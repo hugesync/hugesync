@@ -1,12 +1,12 @@
 //! AWS S3 storage backend
 
 use crate::error::{Error, Result};
-use crate::storage::CompletedPart;
+use crate::storage::{ByteStream, CompletedPart};
 use crate::types::FileEntry;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
-
+use futures::StreamExt;
 use std::path::PathBuf;
 
 /// AWS S3 storage backend
@@ -201,6 +201,45 @@ impl S3Backend {
             })?;
 
         Ok(())
+    }
+
+    /// Write a file from a stream of chunks using multipart upload
+    pub async fn put_stream(
+        &self,
+        path: &str,
+        mut stream: ByteStream,
+        _size_hint: Option<u64>,
+    ) -> Result<()> {
+        const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB minimum for S3
+
+        let upload_id = self.create_multipart_upload(path).await?;
+        let mut parts = Vec::new();
+        let mut part_number = 1;
+        let mut buffer = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            let data = chunk?;
+            buffer.extend_from_slice(&data);
+
+            // Upload when buffer reaches minimum part size
+            if buffer.len() >= MIN_PART_SIZE {
+                let part = self
+                    .upload_part(path, &upload_id, part_number, Bytes::from(std::mem::take(&mut buffer)))
+                    .await?;
+                parts.push(part);
+                part_number += 1;
+            }
+        }
+
+        // Upload remaining data
+        if !buffer.is_empty() {
+            let part = self
+                .upload_part(path, &upload_id, part_number, Bytes::from(buffer))
+                .await?;
+            parts.push(part);
+        }
+
+        self.complete_multipart_upload(path, &upload_id, parts).await
     }
 
     /// Delete a file

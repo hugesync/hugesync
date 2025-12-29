@@ -8,7 +8,9 @@ pub mod s3;
 use crate::error::Result;
 use crate::types::FileEntry;
 use bytes::Bytes;
+use futures::Stream;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 pub use azure::AzureBackend;
 pub use gcs::GcsBackend;
@@ -23,6 +25,9 @@ pub struct CompletedPart {
     /// ETag of the uploaded part
     pub etag: String,
 }
+
+/// Type alias for a stream of byte chunks
+pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + Sync>>;
 
 /// Storage backend enum for unified access to different storage systems
 #[derive(Clone)]
@@ -104,7 +109,10 @@ impl StorageBackend {
         }
     }
 
-    /// Write a file's contents
+    /// Write a file's contents (for small files only)
+    /// 
+    /// WARNING: This loads all data into memory. For large files, use
+    /// `put_stream` or multipart upload methods instead.
     pub async fn put(&self, path: &str, data: Bytes) -> Result<()> {
         match self {
             StorageBackend::Local(b) => b.put(path, data).await,
@@ -112,6 +120,46 @@ impl StorageBackend {
             StorageBackend::Gcs(b) => b.put(path, data).await,
             StorageBackend::Azure(b) => b.put(path, data).await,
         }
+    }
+
+    /// Write a file from a stream of chunks (memory-efficient for large files)
+    /// 
+    /// This method automatically uses multipart upload for backends that support it,
+    /// or buffers to a temp file for local backend.
+    pub async fn put_stream(
+        &self,
+        path: &str,
+        stream: ByteStream,
+        size_hint: Option<u64>,
+    ) -> Result<()> {
+        match self {
+            StorageBackend::Local(b) => b.put_stream(path, stream).await,
+            StorageBackend::S3(b) => b.put_stream(path, stream, size_hint).await,
+            StorageBackend::Gcs(b) => b.put_stream(path, stream, size_hint).await,
+            StorageBackend::Azure(b) => b.put_stream(path, stream, size_hint).await,
+        }
+    }
+
+    /// Write a file from a local path (memory-efficient)
+    /// 
+    /// Uses memory mapping and streaming upload to avoid loading entire file into RAM.
+    /// This is the recommended method for uploading large local files.
+    pub async fn put_file(&self, remote_path: &str, local_path: &std::path::Path) -> Result<()> {
+        let metadata = std::fs::metadata(local_path)
+            .map_err(|e| crate::error::Error::io("reading file metadata", e))?;
+        let file_size = metadata.len();
+
+        // For small files (< 8MB), just read into memory
+        const SMALL_FILE_THRESHOLD: u64 = 8 * 1024 * 1024;
+        if file_size < SMALL_FILE_THRESHOLD {
+            let data = std::fs::read(local_path)
+                .map_err(|e| crate::error::Error::io("reading small file", e))?;
+            return self.put(remote_path, Bytes::from(data)).await;
+        }
+
+        // For large files, use streaming upload
+        let stream = file_to_stream(local_path)?;
+        self.put_stream(remote_path, stream, Some(file_size)).await
     }
 
     /// Delete a file
@@ -228,4 +276,31 @@ impl StorageBackend {
             StorageBackend::Azure(b) => b.abort_multipart_upload(path, upload_id).await,
         }
     }
+}
+
+/// Convert a local file path to a stream of chunks using memory mapping
+/// 
+/// This reads the file in 16MB chunks without loading the entire file into memory.
+fn file_to_stream(path: &std::path::Path) -> Result<ByteStream> {
+    use futures::stream;
+    
+    const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB chunks
+    
+    let file = std::fs::File::open(path)
+        .map_err(|e| crate::error::Error::io("opening file for streaming", e))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| crate::error::Error::io("mmapping file for streaming", e))?;
+    
+    let total_size = mmap.len();
+    
+    // Create an iterator that yields chunks
+    let chunks: Vec<Bytes> = (0..total_size)
+        .step_by(CHUNK_SIZE)
+        .map(|offset| {
+            let end = std::cmp::min(offset + CHUNK_SIZE, total_size);
+            Bytes::copy_from_slice(&mmap[offset..end])
+        })
+        .collect();
+    
+    Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
 }

@@ -1,7 +1,7 @@
 //! Azure Blob Storage backend using native SDK for true delta support
 
 use crate::error::{Error, Result};
-use crate::storage::CompletedPart;
+use crate::storage::{ByteStream, CompletedPart};
 use crate::types::FileEntry;
 
 use azure_storage::prelude::*;
@@ -200,6 +200,27 @@ impl AzureBackend {
         Ok(())
     }
 
+    /// Write a file from a stream of chunks using block upload
+    pub async fn put_stream(
+        &self,
+        path: &str,
+        mut stream: ByteStream,
+        _size_hint: Option<u64>,
+    ) -> Result<()> {
+        let upload_id = self.create_multipart_upload(path).await?;
+        let mut parts = Vec::new();
+        let mut part_number = 1;
+
+        while let Some(chunk) = stream.next().await {
+            let data = chunk?;
+            let part = self.upload_part(path, &upload_id, part_number, data).await?;
+            parts.push(part);
+            part_number += 1;
+        }
+
+        self.complete_multipart_upload(path, &upload_id, parts).await
+    }
+
     /// Delete object
     pub async fn delete(&self, path: &str) -> Result<()> {
         let key = self.resolve_key(path);
@@ -261,18 +282,37 @@ impl AzureBackend {
         let blob_client = self.client.blob_client(upload_id);
         let block_id = Self::generate_block_id(part_number);
 
-        // Construct source URL
-        // https://<account>.blob.core.windows.net/<container>/<source_path>
-        // source_path is the relative path from bucket root.
-        // So we need to resolve it.
+        // Resolve source key and get its blob client
         let source_key = self.resolve_key(source_path);
-        
-        // Full URL is needed.
+        let source_blob_client = self.client.blob_client(&source_key);
+
+        // Generate a SAS token for the source blob with read permission.
+        // This is required because put_block_url performs a server-side GET
+        // which won't inherit our client credentials.
+        let sas_expiry = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let sas_permissions = BlobSasPermissions {
+            read: true,
+            ..Default::default()
+        };
+
+        let sas_token = source_blob_client
+            .shared_access_signature(sas_permissions, sas_expiry)
+            .await
+            .map_err(|e| Error::Azure {
+                message: format!("Failed to generate SAS token: {}", e),
+            })?
+            .token()
+            .map_err(|e| Error::Azure {
+                message: format!("Failed to get SAS token string: {}", e),
+            })?;
+
+        // Construct source URL with SAS token
         let url = format!(
-            "https://{}.blob.core.windows.net/{}/{}",
+            "https://{}.blob.core.windows.net/{}/{}?{}",
             self.account,
             self.container,
-            source_key
+            source_key,
+            sas_token
         );
         let url = url::Url::parse(&url).map_err(|e| Error::config(format!("Invalid source URL: {}", e)))?;
 

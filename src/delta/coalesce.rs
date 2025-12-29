@@ -172,6 +172,11 @@ impl CoalescedOp {
 /// with the 5MB minimum part size requirement (except for the last part).
 /// It uses an accumulating buffer to merge small operations and "steals" data from
 /// large copy operations to satisfy padding requirements.
+///
+/// IMPORTANT: `source_data` contains the LOCAL/TARGET file data. When materializing
+/// Copy operations (reading bytes to convert to Upload), we must use the local file
+/// offset, not the remote source offset. The local offset is tracked as the cumulative
+/// length of all processed operations.
 pub fn prepare_for_s3_upload(
     ops: &[CoalescedOp],
     source_data: &[u8],
@@ -181,6 +186,10 @@ pub fn prepare_for_s3_upload(
     let mut accumulator = Vec::new();
     let mut part_number = 1;
     let mut target_offset = 0u64;
+    // Track position in source_data (the local/target file) separately from
+    // the remote source offset. Delta operations reconstruct the file linearly,
+    // so local_offset is the cumulative length of all processed operations.
+    let mut local_offset = 0u64;
 
     // Helper to emit an upload part
     let emit_upload = |data: Vec<u8>, parts: &mut Vec<S3Part>, p_num: &mut i32, t_off: &mut u64| {
@@ -198,14 +207,19 @@ pub fn prepare_for_s3_upload(
         match op {
             CoalescedOp::Insert { data } => {
                 accumulator.extend_from_slice(data);
+                local_offset += data.len() as u64;
                 // Flush if we have enough data
                 if accumulator.len() as u64 >= S3_MIN_PART_SIZE {
                     emit_upload(std::mem::take(&mut accumulator), &mut parts, &mut part_number, &mut target_offset);
                 }
             }
             CoalescedOp::Copy { source_offset, length } => {
-                let mut current_offset = *source_offset;
+                // Track local position (for reading from source_data) separately
+                // from source position (for S3 CopyRange operations)
+                let mut current_local_offset = local_offset;
+                let mut current_source_offset = *source_offset;
                 let mut current_length = *length;
+                local_offset += *length;
 
                 // If we have data in accumulator, try to fill it to 5MB using this copy
                 if !accumulator.is_empty() {
@@ -213,15 +227,18 @@ pub fn prepare_for_s3_upload(
                     
                     if current_length < needed {
                         // Not enough to fill accumulator, just append everything
-                        let data = read_source(source_data, current_offset, current_length);
+                        // Use local offset to read from source_data (the target file)
+                        let data = read_source(source_data, current_local_offset, current_length);
                         accumulator.extend(data);
                         current_length = 0;
                     } else {
                         // Fill accumulator and emit
-                        let data = read_source(source_data, current_offset, needed);
+                        // Use local offset to read from source_data (the target file)
+                        let data = read_source(source_data, current_local_offset, needed);
                         accumulator.extend(data);
                         emit_upload(std::mem::take(&mut accumulator), &mut parts, &mut part_number, &mut target_offset);
-                        current_offset += needed;
+                        current_local_offset += needed;
+                        current_source_offset += needed;
                         current_length -= needed;
                     }
                 }
@@ -230,10 +247,11 @@ pub fn prepare_for_s3_upload(
                 if current_length > 0 {
                     if current_length >= S3_MIN_PART_SIZE {
                         // Large enough to be its own part(s)
+                        // Use source offset for S3 UploadPartCopy (references remote file)
                         parts.push(S3Part {
                             part_number,
                             content: PartContent::CopyRange {
-                                source_offset: current_offset,
+                                source_offset: current_source_offset,
                                 length: current_length,
                             },
                             target_offset,
@@ -243,7 +261,8 @@ pub fn prepare_for_s3_upload(
 
                     } else {
                         // Too small to be a part, add to accumulator
-                        let data = read_source(source_data, current_offset, current_length);
+                        // Use local offset to read from source_data (the target file)
+                        let data = read_source(source_data, current_local_offset, current_length);
                         accumulator.extend(data);
                     }
                 }
@@ -430,5 +449,43 @@ mod tests {
 
         assert!(!small.meets_min_size(S3_MIN_PART_SIZE));
         assert!(large.meets_min_size(S3_MIN_PART_SIZE));
+    }
+
+    #[test]
+    fn test_prepare_for_s3_upload_with_insert_before_copy() {
+        // This test verifies the fix for the data corruption bug.
+        // When an Insert precedes a Copy, the local offset shifts and we must
+        // read from the correct position in source_data.
+        
+        // Simulate: Original file "AAAAAAAAAA", target file "XXXAAAAAAAAAA"
+        // Delta: Insert("XXX"), Copy(source_offset=0, length=10)
+        let ops = vec![
+            CoalescedOp::Insert { data: b"XXX".to_vec() },
+            CoalescedOp::Copy { source_offset: 0, length: 10 },
+        ];
+        
+        // source_data is the TARGET file content
+        let source_data = b"XXXAAAAAAAAAA";
+        
+        let parts = prepare_for_s3_upload(&ops, source_data, 13);
+        
+        // With the fix, when materializing the Copy operation, we should read
+        // from local_offset=3 (after the Insert), not source_offset=0.
+        // This ensures we get "AAAAAAAAAA" instead of "XXXAAAAAAA".
+        
+        // Verify the combined data is correct
+        let mut result = Vec::new();
+        for part in &parts {
+            match &part.content {
+                PartContent::Upload { data } => result.extend(data),
+                PartContent::CopyRange { .. } => {
+                    // In a real scenario, this would be handled by S3
+                    // For this test, we're checking the Upload parts
+                }
+            }
+        }
+        
+        // The result should be the full target file content
+        assert_eq!(result, b"XXXAAAAAAAAAA");
     }
 }

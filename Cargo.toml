@@ -44,6 +44,9 @@ azure_storage_blobs = "0.21"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 url = "2"
 
+# Time handling (for Azure SAS tokens)
+time = "0.3"
+
 # Delta & Cryptography
 fast_rsync = "0.2"
 blake3 = { version = "1", features = ["rayon", "mmap"] }
