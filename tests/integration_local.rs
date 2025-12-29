@@ -2,8 +2,7 @@
 
 use hugesync::config::Config;
 use hugesync::storage::StorageBackend;
-use hugesync::sync::{create_backends, SyncEngine};
-use hugesync::uri::Location;
+use hugesync::sync::SyncEngine;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;

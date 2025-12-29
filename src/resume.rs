@@ -224,7 +224,6 @@ impl Default for ResumeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
     fn test_state_key_is_deterministic() {

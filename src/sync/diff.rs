@@ -156,9 +156,9 @@ mod tests {
 
     #[test]
     fn test_delta_for_large_files() {
-        let mut source_entry = make_entry("large.bin", 100 * 1024 * 1024);
-        let mut dest_entry = make_entry("large.bin", 99 * 1024 * 1024);
-        
+        let source_entry = make_entry("large.bin", 100 * 1024 * 1024);
+        let dest_entry = make_entry("large.bin", 99 * 1024 * 1024);
+
         let source = vec![source_entry];
         let dest = vec![dest_entry];
         let config = Config::default();

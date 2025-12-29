@@ -75,6 +75,10 @@ pub enum Error {
     /// Azure error
     #[error("Azure error: {message}")]
     Azure { message: String },
+
+    /// SSH error
+    #[error("SSH error: {message}")]
+    Ssh { message: String },
 }
 
 impl Error {

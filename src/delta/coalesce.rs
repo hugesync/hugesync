@@ -474,7 +474,7 @@ mod tests {
         // This ensures we get "AAAAAAAAAA" instead of "XXXAAAAAAA".
         
         // Verify the combined data is correct
-        let mut result = Vec::new();
+        let mut result: Vec<u8> = Vec::new();
         for part in &parts {
             match &part.content {
                 PartContent::Upload { data } => result.extend(data),

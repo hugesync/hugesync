@@ -143,8 +143,8 @@ pub async fn create_backends(
         Location::Azure { container, prefix } => {
             StorageBackend::azure(container.clone(), prefix.clone()).await?
         }
-        Location::Ssh { .. } => {
-            return Err(crate::error::Error::storage("SSH backend not yet implemented"))
+        Location::Ssh { user, host, path } => {
+            StorageBackend::ssh(user.clone(), host.clone(), path.clone(), None).await?
         }
     };
 
@@ -159,8 +159,8 @@ pub async fn create_backends(
         Location::Azure { container, prefix } => {
             StorageBackend::azure(container.clone(), prefix.clone()).await?
         }
-        Location::Ssh { .. } => {
-            return Err(crate::error::Error::storage("SSH backend not yet implemented"))
+        Location::Ssh { user, host, path } => {
+            StorageBackend::ssh(user.clone(), host.clone(), path.clone(), None).await?
         }
     };
 

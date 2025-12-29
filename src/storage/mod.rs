@@ -4,6 +4,7 @@ pub mod azure;
 pub mod gcs;
 pub mod local;
 pub mod s3;
+pub mod ssh;
 
 use crate::error::Result;
 use crate::types::FileEntry;
@@ -16,6 +17,7 @@ pub use azure::AzureBackend;
 pub use gcs::GcsBackend;
 pub use local::LocalBackend;
 pub use s3::S3Backend;
+pub use ssh::SshBackend;
 
 /// Completed multipart upload part info
 #[derive(Debug, Clone)]
@@ -36,6 +38,7 @@ pub enum StorageBackend {
     S3(S3Backend),
     Gcs(GcsBackend),
     Azure(AzureBackend),
+    Ssh(SshBackend),
 }
 
 impl StorageBackend {
@@ -59,6 +62,16 @@ impl StorageBackend {
         Ok(StorageBackend::Azure(AzureBackend::new(container, prefix).await?))
     }
 
+    /// Create an SSH backend
+    pub async fn ssh(
+        user: Option<String>,
+        host: String,
+        path: String,
+        port: Option<u16>,
+    ) -> Result<Self> {
+        Ok(StorageBackend::Ssh(SshBackend::new(user, host, path, port).await?))
+    }
+
     /// Get the name of this backend (for logging)
     pub fn name(&self) -> &'static str {
         match self {
@@ -66,6 +79,7 @@ impl StorageBackend {
             StorageBackend::S3(_) => "s3",
             StorageBackend::Gcs(_) => "gcs",
             StorageBackend::Azure(_) => "azure",
+            StorageBackend::Ssh(_) => "ssh",
         }
     }
 
@@ -76,6 +90,7 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.list(prefix).await,
             StorageBackend::Gcs(b) => b.list(prefix).await,
             StorageBackend::Azure(b) => b.list(prefix).await,
+            StorageBackend::Ssh(b) => b.list(prefix).await,
         }
     }
 
@@ -86,6 +101,7 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.head(path).await,
             StorageBackend::Gcs(b) => b.head(path).await,
             StorageBackend::Azure(b) => b.head(path).await,
+            StorageBackend::Ssh(b) => b.head(path).await,
         }
     }
 
@@ -96,6 +112,7 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.get(path).await,
             StorageBackend::Gcs(b) => b.get(path).await,
             StorageBackend::Azure(b) => b.get(path).await,
+            StorageBackend::Ssh(b) => b.get(path).await,
         }
     }
 
@@ -106,11 +123,12 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.get_range(path, start, end).await,
             StorageBackend::Gcs(b) => b.get_range(path, start, end).await,
             StorageBackend::Azure(b) => b.get_range(path, start, end).await,
+            StorageBackend::Ssh(b) => b.get_range(path, start, end).await,
         }
     }
 
     /// Write a file's contents (for small files only)
-    /// 
+    ///
     /// WARNING: This loads all data into memory. For large files, use
     /// `put_stream` or multipart upload methods instead.
     pub async fn put(&self, path: &str, data: Bytes) -> Result<()> {
@@ -119,11 +137,12 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.put(path, data).await,
             StorageBackend::Gcs(b) => b.put(path, data).await,
             StorageBackend::Azure(b) => b.put(path, data).await,
+            StorageBackend::Ssh(b) => b.put(path, data).await,
         }
     }
 
     /// Write a file from a stream of chunks (memory-efficient for large files)
-    /// 
+    ///
     /// This method automatically uses multipart upload for backends that support it,
     /// or buffers to a temp file for local backend.
     pub async fn put_stream(
@@ -137,6 +156,7 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.put_stream(path, stream, size_hint).await,
             StorageBackend::Gcs(b) => b.put_stream(path, stream, size_hint).await,
             StorageBackend::Azure(b) => b.put_stream(path, stream, size_hint).await,
+            StorageBackend::Ssh(b) => b.put_stream(path, stream).await,
         }
     }
 
@@ -169,6 +189,7 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.delete(path).await,
             StorageBackend::Gcs(b) => b.delete(path).await,
             StorageBackend::Azure(b) => b.delete(path).await,
+            StorageBackend::Ssh(b) => b.delete(path).await,
         }
     }
 
@@ -184,6 +205,7 @@ impl StorageBackend {
             StorageBackend::S3(_) => true,
             StorageBackend::Gcs(_) => true,  // GCS supports compose
             StorageBackend::Azure(_) => true, // Azure supports block list
+            StorageBackend::Ssh(_) => false,  // SSH uses streaming
         }
     }
 
@@ -194,6 +216,7 @@ impl StorageBackend {
             StorageBackend::S3(_) => true,
             StorageBackend::Gcs(_) => false,  // GCS requires XML API for server-side copy
             StorageBackend::Azure(_) => true, // Azure can copy blocks
+            StorageBackend::Ssh(_) => false,  // SSH doesn't support server-side copy
         }
     }
 
@@ -206,6 +229,7 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.create_multipart_upload(path).await,
             StorageBackend::Gcs(b) => b.create_multipart_upload(path).await,
             StorageBackend::Azure(b) => b.create_multipart_upload(path).await,
+            StorageBackend::Ssh(_) => Err(crate::error::Error::storage("multipart not supported for SSH")),
         }
     }
 
@@ -222,6 +246,7 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.upload_part(path, upload_id, part_number, data).await,
             StorageBackend::Gcs(b) => b.upload_part(path, upload_id, part_number, data).await,
             StorageBackend::Azure(b) => b.upload_part(path, upload_id, part_number, data).await,
+            StorageBackend::Ssh(_) => Err(crate::error::Error::storage("multipart not supported for SSH")),
         }
     }
 
@@ -249,6 +274,7 @@ impl StorageBackend {
                 b.upload_part_copy(path, upload_id, part_number, source_path, source_start, source_end)
                     .await
             }
+            StorageBackend::Ssh(_) => Err(crate::error::Error::storage("part copy not supported for SSH")),
         }
     }
 
@@ -264,6 +290,7 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.complete_multipart_upload(path, upload_id, parts).await,
             StorageBackend::Gcs(b) => b.complete_multipart_upload(path, upload_id, parts).await,
             StorageBackend::Azure(b) => b.complete_multipart_upload(path, upload_id, parts).await,
+            StorageBackend::Ssh(_) => Err(crate::error::Error::storage("multipart not supported for SSH")),
         }
     }
 
@@ -274,6 +301,7 @@ impl StorageBackend {
             StorageBackend::S3(b) => b.abort_multipart_upload(path, upload_id).await,
             StorageBackend::Gcs(b) => b.abort_multipart_upload(path, upload_id).await,
             StorageBackend::Azure(b) => b.abort_multipart_upload(path, upload_id).await,
+            StorageBackend::Ssh(_) => Err(crate::error::Error::storage("multipart not supported for SSH")),
         }
     }
 }

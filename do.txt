@@ -293,4 +293,32 @@ KEY DESIGN DECISIONS
 4. Sidecar Location: Same path as file with .hssig extension
 5. Config Priority: CLI > env vars > config file > defaults
 
+CODE QUALITY OBSERVATIONS:
+--------------------------
+
+1. Error Handling: Consistent use of thiserror with proper error variants
+2. Testing: 68 tests covering core functionality (all passing)
+3. Memory Safety: Uses memmap2 for large files to avoid OOM
+4. Async: Proper tokio async/await patterns throughout
+5. Cloud Backends: S3, GCS, Azure all implement same trait interface
+
+POTENTIAL IMPROVEMENTS (NOT IMPLEMENTED - for future consideration):
+--------------------------------------------------------------------
+
+1. GCS multipart uses simplified compose model (works but could optimize)
+2. Could add more integration tests for cloud backends (requires credentials)
+3. Resume manager could benefit from cleanup on startup
+
+SSH LIMITATIONS:
+------------
+- No multipart upload support (uses streaming instead)
+- No server-side copy support (full file transfer required for delta)
+- Delta sync falls back to full upload for SSH destinations
+- Passphrase-protected keys not yet supported (use ssh-agent)
+
+TESTING:
+--------
+SSH tests are ignored by default (require real SSH server).
+Run with: SSH_TEST_HOST=hostname SSH_TEST_USER=user cargo test ssh --ignored
+
 ================================================================================

@@ -232,11 +232,11 @@ mod tests {
     #[test]
     fn test_rolling_checksum_update() {
         let data = b"abcdefgh";
-        let initial = RollingChecksum::new(&data[0..4]); // "abcd"
-        
+        let _initial = RollingChecksum::new(&data[0..4]); // "abcd"
+
         let mut rolled = RollingChecksum::new(&data[0..4]);
         rolled.roll(b'a', b'e'); // Should now be "bcde"
-        
+
         let expected = RollingChecksum::new(&data[1..5]); // "bcde"
         assert_eq!(rolled.value(), expected.value());
     }
