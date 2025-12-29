@@ -27,6 +27,7 @@ SECTION 1: PROJECT FOUNDATION & CORE TYPES
     - FileEntry: path, size, mtime, mode, is_dir
     - SyncAction enum: Upload, Download, Delete, Skip, Delta
     - SyncStats: files_scanned, bytes_transferred, bytes_saved, duration
+    - AtomicSyncStats: thread-safe version with atomic counters
 
 ================================================================================
 SECTION 2: CLI INTERFACE
@@ -75,6 +76,11 @@ SECTION 3: URI PARSING & STORAGE ABSTRACTION
 [ ] 3.6 Create src/storage/azure.rs - Azure Blob Storage backend
     - (Deferred) Azure Block List support
 
+[x] 3.7 Create src/storage/ssh.rs - SSH/SFTP backend
+    - Pure Rust SSH via russh/russh-sftp
+    - Agent and key-file authentication
+    - Full SFTP operations (list, get, put, delete)
+
 ================================================================================
 SECTION 4: SIGNATURE & DELTA ENGINE
 ================================================================================
@@ -108,6 +114,7 @@ SECTION 4: SIGNATURE & DELTA ENGINE
     - Ensure no part < 5MB (S3 minimum)
     - Merge small Insert operations
     - Align operations to 5MB boundaries where possible
+    - Zero-copy Bytes handling for uploads
 
 ================================================================================
 SECTION 5: SYNC ENGINE
@@ -189,96 +196,143 @@ SECTION 7: RESUME & RELIABILITY
     - Distinguish retryable vs fatal errors
 
 ================================================================================
-SECTION 8: INTEGRATION & TESTING
+SECTION 8: RSYNC-COMPATIBLE FEATURES (NEW)
 ================================================================================
 
-[x] 8.1 Create tests/integration_local.rs
+This section adds rsync-compatible options for full feature parity.
+
+[x] 8.1 Comparison Mode Options
+    - --checksum / -c: Use checksums instead of mtime+size for comparison
+    - --size-only: Compare by file size only (ignore mtime)
+    - --update / -u: Skip files newer on the receiver
+    - --ignore-existing: Skip files that already exist on receiver
+    - --existing: Only update files that already exist on receiver
+    - --modify-window=NUM: Compare mod times with tolerance (seconds)
+
+[x] 8.2 File Size Filtering
+    - --max-size=SIZE: Don't transfer files larger than SIZE
+    - --min-size=SIZE: Don't transfer files smaller than SIZE
+    - SIZE format: 100, 100K, 100M, 100G
+
+[ ] 8.3 Symlink Handling
+    - --links / -l: Copy symlinks as symlinks (default in archive mode)
+    - --copy-links / -L: Transform symlinks into referent file/dir
+    - --safe-links: Ignore symlinks pointing outside tree
+    - --copy-unsafe-links: Only copy unsafe symlinks as files
+
+[ ] 8.4 Transfer Mode Options
+    - --whole-file / -W: Disable delta-transfer, always copy whole files
+    - --inplace: Update destination files in-place
+    - --append: Append data to shorter files
+    - --append-verify: Like --append but verify with checksum
+
+[x] 8.5 Backup Functionality
+    - --backup / -b: Make backups of changed files
+    - --backup-dir=DIR: Store backups in specified directory
+    - --suffix=SUFFIX: Backup suffix (default: ~)
+
+[x] 8.6 Bandwidth Limiting
+    - --bwlimit=RATE: Limit bandwidth in KiB/s
+    - Rate limiting via token bucket algorithm
+    - Apply to both upload and download
+
+[ ] 8.7 Partial Transfer Support
+    - --partial: Keep partially transferred files
+    - --partial-dir=DIR: Put partial files in a directory
+    - Resume from partial files on restart
+
+[ ] 8.8 Source File Handling
+    - --remove-source-files: Remove source files after successful transfer
+    - --delay-updates: Put all updated files into place at end
+
+[x] 8.9 Output & Logging
+    - --itemize-changes / -i: Output change summary for each file
+      Format: YXcstpoguax (like rsync)
+    - --log-file=FILE: Log transfers to a file
+    - --stats: Show detailed transfer statistics at end
+    - --human-readable / -h: Output numbers in human-readable format (default)
+
+[ ] 8.10 Compare/Copy/Link Destination
+    - --compare-dest=DIR: Compare against files in DIR (if missing at dest)
+    - --copy-dest=DIR: Copy from DIR if file matches (instead of source)
+    - --link-dest=DIR: Hardlink to files in DIR when unchanged
+
+[ ] 8.11 Filesystem Boundary
+    - --one-file-system / -x: Don't cross filesystem boundaries
+
+[ ] 8.12 Archive Mode Expansion
+    - -a / --archive = -rlptgoD (recursive, links, perms, times, group, owner, devices)
+    - --no-OPTION: Disable individual archive components
+
+================================================================================
+SECTION 9: INTEGRATION & TESTING
+================================================================================
+
+[x] 9.1 Create tests/integration_local.rs
     - Test local-to-local sync
     - Test file creation, modification, deletion
     - Test filtering (include/exclude)
 
-[ ] 8.2 Create tests/integration_s3.rs
+[ ] 9.2 Create tests/integration_s3.rs
     - (Requires localstack/minio for testing)
 
-[x] 8.3 Create tests/delta_tests.rs
+[x] 9.3 Create tests/delta_tests.rs
     - Test signature generation
     - Test delta computation
     - Test chunk coalescing
     - Verify byte savings
 
-[ ] 8.4 Create benches/scan_bench.rs
+[ ] 9.4 Create tests/rsync_compat_tests.rs
+    - Test rsync option compatibility
+    - Test comparison modes
+    - Test filtering options
+    - Test backup functionality
+
+[ ] 9.5 Create benches/scan_bench.rs
     - (Deferred)
 
-[ ] 8.5 Create benches/delta_bench.rs
+[ ] 9.6 Create benches/delta_bench.rs
     - (Deferred)
 
 ================================================================================
-SECTION 9: POLISH & DOCUMENTATION
+SECTION 10: POLISH & DOCUMENTATION
 ================================================================================
 
-[x] 9.1 Update README.md
+[x] 10.1 Update README.md
     - Installation instructions
     - Quick start examples
     - Configuration reference
     - Performance tips
 
-[x] 9.2 Create CHANGELOG.md
+[x] 10.2 Create CHANGELOG.md
     - Initial release notes
 
-[ ] 9.3 Create examples/
+[ ] 10.3 Create examples/
     - (Deferred)
 
 ================================================================================
-IMPLEMENTATION ORDER (RECOMMENDED)
+IMPLEMENTATION ORDER FOR RSYNC FEATURES
 ================================================================================
 
-Phase A - Foundation (Days 1-2):
-  [x] 1.1 src/lib.rs
-  [x] 1.2 src/error.rs
-  [x] 1.3 src/config.rs
-  [x] 1.4 src/types.rs
-  [x] 2.1 src/cli.rs
-  [x] 2.2 src/main.rs (basic)
+Phase 1 - Core Comparison (DONE):
+  [x] 8.1 Comparison modes (checksum, size-only, update, ignore-existing, existing)
+  [x] 8.2 File size filtering (max-size, min-size)
+  [ ] 8.4 Transfer modes (whole-file, inplace) - CLI added, integration pending
 
-Phase B - Local Storage (Days 3-4):
-  [x] 3.1 src/uri.rs
-  [x] 3.2 src/storage/mod.rs (enum)
-  [x] 3.3 src/storage/local.rs
-  [x] 5.2 src/sync/scan.rs (local only)
+Phase 2 - File Handling:
+  [ ] 8.3 Symlink handling (links, copy-links, safe-links) - CLI added
+  [x] 8.5 Backup functionality
+  [ ] 8.8 Source file handling (remove-source-files) - CLI added
 
-Phase C - Basic Sync (Days 5-7):
-  [x] 5.1 src/sync/mod.rs
-  [x] 5.3 src/sync/diff.rs
-  [x] 5.4 src/sync/plan.rs
-  [x] 5.5 src/sync/execute.rs (simple upload)
-  [x] 6.1 src/progress.rs
-  [x] Test: local-to-local sync works
+Phase 3 - Performance & Control:
+  [x] 8.6 Bandwidth limiting
+  [ ] 8.7 Partial transfer support - CLI added
+  [ ] 8.11 Filesystem boundary - CLI added
 
-Phase D - S3 Backend (Days 8-10):
-  [x] 3.4 src/storage/s3.rs
-  [x] 7.2 src/retry.rs
-  [ ] Test: local-to-S3 sync works (full files)
-
-Phase E - Delta Engine (Days 11-15):
-  [x] 4.1 src/signature/mod.rs
-  [x] 4.2 src/signature/generate.rs
-  [x] 4.3 src/signature/file.rs
-  [x] 4.4 src/delta/mod.rs
-  [x] 4.5 src/delta/compute.rs
-  [x] 4.6 src/delta/coalesce.rs
-  [x] 5.6 src/sync/delta_upload.rs
-  [x] Test: delta sync reduces bandwidth
-
-Phase F - Production Features (Days 16-20):
-  [x] 5.7 src/sync/conflict.rs
-  [x] 7.1 src/resume.rs
-  [ ] 3.5 src/storage/gcs.rs
-  [ ] 3.6 src/storage/azure.rs
-
-Phase G - Polish (Days 21-25):
-  [x] 8.1 integration_local.rs
-  [x] 8.3 delta_tests.rs
-  [x] 9.1 README.md
+Phase 4 - Output & Advanced:
+  [x] 8.9 Itemize changes and logging
+  [ ] 8.10 Compare/copy/link destination - CLI added
+  [ ] 8.12 Archive mode expansion
 
 ================================================================================
 KEY DESIGN DECISIONS
@@ -297,20 +351,16 @@ CODE QUALITY OBSERVATIONS:
 --------------------------
 
 1. Error Handling: Consistent use of thiserror with proper error variants
-2. Testing: 68 tests covering core functionality (all passing)
+2. Testing: 88+ tests covering core functionality (all passing)
 3. Memory Safety: Uses memmap2 for large files to avoid OOM
 4. Async: Proper tokio async/await patterns throughout
-5. Cloud Backends: S3, GCS, Azure all implement same trait interface
-
-POTENTIAL IMPROVEMENTS (NOT IMPLEMENTED - for future consideration):
---------------------------------------------------------------------
-
-1. GCS multipart uses simplified compose model (works but could optimize)
-2. Could add more integration tests for cloud backends (requires credentials)
-3. Resume manager could benefit from cleanup on startup
+5. Cloud Backends: S3, GCS, Azure, SSH all implement same interface
+6. Zero-Copy: Uses Bytes for efficient data transfer
+7. Atomic Stats: Thread-safe statistics with AtomicU64 counters
+8. Rsync Compat: Core comparison modes, backup, bandwidth limiting, itemized output
 
 SSH LIMITATIONS:
-------------
+----------------
 - No multipart upload support (uses streaming instead)
 - No server-side copy support (full file transfer required for delta)
 - Delta sync falls back to full upload for SSH destinations

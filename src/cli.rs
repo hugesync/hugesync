@@ -35,13 +35,15 @@ pub enum Commands {
 /// Arguments for the sync command
 #[derive(Parser, Debug)]
 pub struct SyncArgs {
-    /// Source path or URI (local path, s3://, gs://, az://)
+    /// Source path or URI (local path, s3://, gs://, az://, user@host:path)
     pub source: String,
 
-    /// Destination path or URI (local path, s3://, gs://, az://)
+    /// Destination path or URI (local path, s3://, gs://, az://, user@host:path)
     pub destination: String,
 
-    /// Archive mode: recursive, preserve attributes
+    // ==================== Basic Options ====================
+
+    /// Archive mode: recursive, preserve attributes (-rlptgoD)
     #[arg(short = 'a', long)]
     pub archive: bool,
 
@@ -65,6 +67,150 @@ pub struct SyncArgs {
     #[arg(long)]
     pub delete_excluded: bool,
 
+    // ==================== Comparison Options ====================
+
+    /// Skip based on checksum, not mod-time & size
+    #[arg(short = 'c', long)]
+    pub checksum: bool,
+
+    /// Skip files that are newer on the receiver
+    #[arg(short = 'u', long)]
+    pub update: bool,
+
+    /// Skip updating files that already exist on receiver
+    #[arg(long)]
+    pub ignore_existing: bool,
+
+    /// Skip creating new files on receiver (only update existing)
+    #[arg(long)]
+    pub existing: bool,
+
+    /// Compare by size only (ignore mod-time)
+    #[arg(long)]
+    pub size_only: bool,
+
+    /// Compare mod-times with reduced accuracy (seconds)
+    #[arg(long, default_value = "0")]
+    pub modify_window: i64,
+
+    // ==================== Transfer Options ====================
+
+    /// Disable delta-transfer algorithm (always send whole files)
+    #[arg(short = 'W', long)]
+    pub whole_file: bool,
+
+    /// Update destination files in-place
+    #[arg(long)]
+    pub inplace: bool,
+
+    /// Append data onto shorter files
+    #[arg(long)]
+    pub append: bool,
+
+    /// Append with old data verified via checksum
+    #[arg(long)]
+    pub append_verify: bool,
+
+    // ==================== Symlink Options ====================
+
+    /// Copy symlinks as symlinks
+    #[arg(short = 'l', long)]
+    pub links: bool,
+
+    /// Transform symlink into referent file/dir
+    #[arg(short = 'L', long)]
+    pub copy_links: bool,
+
+    /// Ignore symlinks that point outside the source tree
+    #[arg(long)]
+    pub safe_links: bool,
+
+    /// Transform unsafe symlinks into files
+    #[arg(long)]
+    pub copy_unsafe_links: bool,
+
+    // ==================== Backup Options ====================
+
+    /// Make backups of changed files
+    #[arg(short = 'b', long)]
+    pub backup: bool,
+
+    /// Store backups in specified directory
+    #[arg(long)]
+    pub backup_dir: Option<PathBuf>,
+
+    /// Backup suffix (default: ~)
+    #[arg(long, default_value = "~")]
+    pub suffix: String,
+
+    // ==================== Size Filtering ====================
+
+    /// Don't transfer files larger than SIZE (e.g., 100M, 1G)
+    #[arg(long)]
+    pub max_size: Option<String>,
+
+    /// Don't transfer files smaller than SIZE (e.g., 1K, 100)
+    #[arg(long)]
+    pub min_size: Option<String>,
+
+    // ==================== Bandwidth & Performance ====================
+
+    /// Limit I/O bandwidth in KiB/s
+    #[arg(long)]
+    pub bwlimit: Option<u64>,
+
+    // ==================== Partial Transfer ====================
+
+    /// Keep partially transferred files
+    #[arg(long)]
+    pub partial: bool,
+
+    /// Put partially transferred files into DIR
+    #[arg(long)]
+    pub partial_dir: Option<PathBuf>,
+
+    // ==================== Source Handling ====================
+
+    /// Remove synchronized files from source
+    #[arg(long)]
+    pub remove_source_files: bool,
+
+    // ==================== Filesystem ====================
+
+    /// Don't cross filesystem boundaries
+    #[arg(short = 'x', long)]
+    pub one_file_system: bool,
+
+    // ==================== Output & Logging ====================
+
+    /// Output a change-summary for all updates
+    #[arg(short = 'i', long)]
+    pub itemize_changes: bool,
+
+    /// Log transfers to FILE
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
+
+    /// Give some file-transfer stats at end
+    #[arg(long)]
+    pub stats: bool,
+
+    // ==================== Compare/Copy/Link Destination ====================
+
+    /// Compare against files in DIR
+    #[arg(long)]
+    pub compare_dest: Option<PathBuf>,
+
+    /// Like --compare-dest but also use file from DIR
+    #[arg(long)]
+    pub copy_dest: Option<PathBuf>,
+
+    /// Hardlink to files in DIR when unchanged
+    #[arg(long)]
+    pub link_dest: Option<PathBuf>,
+
+    // ==================== Delta Sync Options ====================
+
     /// Ignore missing source arguments
     #[arg(long)]
     pub ignore_missing_args: bool,
@@ -85,6 +231,8 @@ pub struct SyncArgs {
     #[arg(long, default_value = "5120", value_parser = clap::value_parser!(u64).range(64..=5120))]
     pub block_size: u64,
 
+    // ==================== Filtering ====================
+
     /// Include pattern (can be specified multiple times)
     #[arg(long = "include", action = clap::ArgAction::Append)]
     pub include: Vec<String>,
@@ -94,32 +242,93 @@ pub struct SyncArgs {
     pub exclude: Vec<String>,
 
     /// Configuration file path
-    #[arg(short = 'c', long)]
+    #[arg(long = "config")]
     pub config: Option<PathBuf>,
 }
 
 impl SyncArgs {
     /// Convert CLI args to Config, merging with file config
     pub fn to_config(&self) -> crate::config::Config {
+        use crate::config::Config;
+
         let mut config = if let Some(ref path) = self.config {
-            crate::config::Config::load_from(path).unwrap_or_default()
+            Config::load_from(path).unwrap_or_default()
         } else {
-            crate::config::Config::load().unwrap_or_default()
+            Config::load().unwrap_or_default()
         };
 
-        // CLI args override config file
+        // Basic options
         config.archive = self.archive;
         config.dry_run = self.dry_run;
         config.progress = self.progress;
         config.jobs = self.jobs;
         config.delete = self.delete;
         config.delete_excluded = self.delete_excluded;
+
+        // Comparison options
+        config.checksum = self.checksum;
+        config.update = self.update;
+        config.ignore_existing = self.ignore_existing;
+        config.existing = self.existing;
+        config.size_only = self.size_only;
+        config.modify_window = self.modify_window;
+
+        // Transfer options
+        config.whole_file = self.whole_file;
+        config.inplace = self.inplace;
+        config.append = self.append;
+        config.append_verify = self.append_verify;
+
+        // Symlink options
+        config.links = self.links || self.archive; // -a implies -l
+        config.copy_links = self.copy_links;
+        config.safe_links = self.safe_links;
+        config.copy_unsafe_links = self.copy_unsafe_links;
+
+        // Backup options
+        config.backup = self.backup;
+        config.backup_dir = self.backup_dir.clone();
+        config.backup_suffix = self.suffix.clone();
+
+        // Size filtering (parse size strings)
+        if let Some(ref max_size) = self.max_size {
+            config.max_size = Config::parse_size(max_size).unwrap_or(0);
+        }
+        if let Some(ref min_size) = self.min_size {
+            config.min_size = Config::parse_size(min_size).unwrap_or(0);
+        }
+
+        // Bandwidth limiting
+        config.bwlimit = self.bwlimit.unwrap_or(0);
+
+        // Partial transfer
+        config.partial = self.partial;
+        config.partial_dir = self.partial_dir.clone();
+
+        // Source handling
+        config.remove_source_files = self.remove_source_files;
+
+        // Filesystem
+        config.one_file_system = self.one_file_system;
+
+        // Output & logging
+        config.itemize_changes = self.itemize_changes;
+        config.log_file = self.log_file.clone();
+        config.stats = self.stats;
+
+        // Compare/copy/link destination
+        config.compare_dest = self.compare_dest.clone();
+        config.copy_dest = self.copy_dest.clone();
+        config.link_dest = self.link_dest.clone();
+
+        // Delta sync options
         config.ignore_missing_args = self.ignore_missing_args;
         config.delta_threshold = self.delta_threshold * 1024 * 1024; // Convert MB to bytes
         config.no_sidecar = self.no_sidecar;
         config.fail_on_conflict = self.fail_on_conflict;
-        config.block_size = crate::config::Config::validate_block_size(self.block_size as usize);
+        config.block_size = Config::validate_block_size(self.block_size as usize);
 
+        // Filtering
         if !self.include.is_empty() {
             config.include = self.include.clone();
         }

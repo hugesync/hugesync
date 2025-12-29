@@ -28,6 +28,11 @@ impl LocalBackend {
         &self.root
     }
 
+    /// Get the base path (alias for root)
+    pub fn base_path(&self) -> &PathBuf {
+        &self.root
+    }
+
     /// Resolve a relative path to an absolute path
     fn resolve(&self, path: &str) -> PathBuf {
         if path.is_empty() {

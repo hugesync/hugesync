@@ -3,11 +3,14 @@
 //! This library provides efficient delta synchronization between local filesystems
 //! and cloud object storage (S3, GCS, Azure).
 
+pub mod backup;
+pub mod bwlimit;
 pub mod cli;
 pub mod config;
 pub mod delta;
 pub mod error;
 pub mod format;
+pub mod itemize;
 pub mod progress;
 pub mod resume;
 pub mod retry;
