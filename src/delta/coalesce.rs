@@ -7,6 +7,7 @@
 //! 3. Providing fallback strategies when parts are too small
 
 use super::{Delta, DeltaOp};
+use bytes::Bytes;
 
 /// S3 minimum part size (5MB)
 pub const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -191,12 +192,12 @@ pub fn prepare_for_s3_upload(
     // so local_offset is the cumulative length of all processed operations.
     let mut local_offset = 0u64;
 
-    // Helper to emit an upload part
+    // Helper to emit an upload part (converts Vec to Bytes for zero-copy)
     let emit_upload = |data: Vec<u8>, parts: &mut Vec<S3Part>, p_num: &mut i32, t_off: &mut u64| {
         let len = data.len() as u64;
         parts.push(S3Part {
             part_number: *p_num,
-            content: PartContent::Upload { data },
+            content: PartContent::Upload { data: Bytes::from(data) },
             target_offset: *t_off,
         });
         *p_num += 1;
@@ -317,8 +318,9 @@ pub enum PartContent {
         length: u64,
     },
     /// Upload new data (UploadPart)
+    /// Uses Bytes for zero-copy transfer to upload functions
     Upload {
-        data: Vec<u8>,
+        data: Bytes,
     },
 }
 

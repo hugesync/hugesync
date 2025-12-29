@@ -172,13 +172,14 @@ async fn delta_upload_multipart(
                     size = data.len(),
                     "Uploading new data"
                 );
-                
+
                 let len = data.len() as u64;
+                // data is already Bytes - zero-copy transfer
                 let completed = storage.upload_part(
                     remote_path,
                     &upload_id,
                     part_number,
-                    Bytes::from(data),
+                    data,
                 ).await?;
 
                 completed_parts.push(completed);
@@ -238,15 +239,21 @@ async fn full_upload_simple(
     let data = std::fs::read(local_path)
         .map_err(|e| Error::io("reading local file", e))?;
 
-    // Upload file
-    storage.put(remote_path, Bytes::from(data.clone())).await?;
-
-    // Generate and upload signature if file is large enough
-    if !config.no_sidecar && file_size >= config.delta_threshold {
+    // Generate signature before uploading if needed (avoids clone)
+    let sig_data = if !config.no_sidecar && file_size >= config.delta_threshold {
         let sig = crate::signature::generate::generate_signature_from_bytes(&data, config.block_size);
-        let sig_data = write_signature_to_bytes(&sig)?;
+        Some(write_signature_to_bytes(&sig)?)
+    } else {
+        None
+    };
+
+    // Upload file (zero-copy via Bytes)
+    storage.put(remote_path, Bytes::from(data)).await?;
+
+    // Upload signature if generated
+    if let Some(sig_bytes) = sig_data {
         let sig_path = format!("{}.hssig", remote_path);
-        storage.put(&sig_path, Bytes::from(sig_data)).await?;
+        storage.put(&sig_path, Bytes::from(sig_bytes)).await?;
     }
 
     Ok(DeltaUploadResult {

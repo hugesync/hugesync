@@ -126,24 +126,29 @@ impl LocalBackend {
     }
 
     /// Read a range of bytes from a file
+    ///
+    /// Uses BytesMut for zero-copy conversion to Bytes
     pub async fn get_range(&self, path: &str, start: u64, end: u64) -> Result<Bytes> {
+        use bytes::BytesMut;
+        use tokio::io::AsyncSeekExt;
+
         let full_path = self.resolve(path);
         let mut file = fs::File::open(&full_path)
             .await
             .map_err(|e| Error::io("opening file", e))?;
 
-        use tokio::io::AsyncSeekExt;
         file.seek(std::io::SeekFrom::Start(start))
             .await
             .map_err(|e| Error::io("seeking file", e))?;
 
         let len = (end - start + 1) as usize;
-        let mut buf = vec![0u8; len];
+        // Use BytesMut for zero-copy freeze to Bytes
+        let mut buf = BytesMut::zeroed(len);
         file.read_exact(&mut buf)
             .await
             .map_err(|e| Error::io("reading range", e))?;
 
-        Ok(Bytes::from(buf))
+        Ok(buf.freeze())
     }
 
     /// Write a file's contents

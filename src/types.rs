@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// File entry representing a file or directory in a sync location
@@ -198,6 +199,124 @@ impl SyncStats {
         } else {
             self.bytes_transferred as f64 / self.duration_secs
         }
+    }
+}
+
+/// Atomic statistics for thread-safe concurrent sync operations
+///
+/// Uses atomic operations for lock-free updates from multiple threads.
+/// Can be converted to SyncStats for display and serialization.
+#[derive(Debug)]
+pub struct AtomicSyncStats {
+    pub files_scanned: AtomicU64,
+    pub dirs_scanned: AtomicU64,
+    pub files_uploaded: AtomicU64,
+    pub files_downloaded: AtomicU64,
+    pub files_deleted: AtomicU64,
+    pub files_skipped: AtomicU64,
+    pub files_delta: AtomicU64,
+    pub bytes_transferred: AtomicU64,
+    pub bytes_saved: AtomicU64,
+    pub bytes_total: AtomicU64,
+    pub errors: AtomicU64,
+}
+
+impl AtomicSyncStats {
+    /// Create new atomic stats with all counters at zero
+    pub fn new() -> Self {
+        Self {
+            files_scanned: AtomicU64::new(0),
+            dirs_scanned: AtomicU64::new(0),
+            files_uploaded: AtomicU64::new(0),
+            files_downloaded: AtomicU64::new(0),
+            files_deleted: AtomicU64::new(0),
+            files_skipped: AtomicU64::new(0),
+            files_delta: AtomicU64::new(0),
+            bytes_transferred: AtomicU64::new(0),
+            bytes_saved: AtomicU64::new(0),
+            bytes_total: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+        }
+    }
+
+    /// Atomically increment files uploaded counter
+    #[inline]
+    pub fn inc_files_uploaded(&self) {
+        self.files_uploaded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically increment files downloaded counter
+    #[inline]
+    pub fn inc_files_downloaded(&self) {
+        self.files_downloaded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically increment files deleted counter
+    #[inline]
+    pub fn inc_files_deleted(&self) {
+        self.files_deleted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically increment files skipped counter
+    #[inline]
+    pub fn inc_files_skipped(&self) {
+        self.files_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically increment delta sync counter
+    #[inline]
+    pub fn inc_files_delta(&self) {
+        self.files_delta.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically increment errors counter
+    #[inline]
+    pub fn inc_errors(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically add to bytes transferred
+    #[inline]
+    pub fn add_bytes_transferred(&self, bytes: u64) {
+        self.bytes_transferred.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Atomically add to bytes saved
+    #[inline]
+    pub fn add_bytes_saved(&self, bytes: u64) {
+        self.bytes_saved.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Atomically add to bytes total
+    #[inline]
+    pub fn add_bytes_total(&self, bytes: u64) {
+        self.bytes_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Convert to non-atomic SyncStats (for display/serialization)
+    ///
+    /// Note: This provides a snapshot; values may change if updates are ongoing.
+    pub fn snapshot(&self) -> SyncStats {
+        SyncStats {
+            files_scanned: self.files_scanned.load(Ordering::Relaxed),
+            dirs_scanned: self.dirs_scanned.load(Ordering::Relaxed),
+            files_uploaded: self.files_uploaded.load(Ordering::Relaxed),
+            files_downloaded: self.files_downloaded.load(Ordering::Relaxed),
+            files_deleted: self.files_deleted.load(Ordering::Relaxed),
+            files_skipped: self.files_skipped.load(Ordering::Relaxed),
+            files_delta: self.files_delta.load(Ordering::Relaxed),
+            bytes_transferred: self.bytes_transferred.load(Ordering::Relaxed),
+            bytes_saved: self.bytes_saved.load(Ordering::Relaxed),
+            bytes_total: self.bytes_total.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            duration_secs: 0.0, // Set by caller
+        }
+    }
+}
+
+impl Default for AtomicSyncStats {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
