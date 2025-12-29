@@ -1,0 +1,313 @@
+================================================================================
+                         HUGESYNC IMPLEMENTATION PLAN
+                              do.txt - Full Roadmap
+================================================================================
+
+This document provides a complete, section-by-section implementation plan for
+building HugeSync from scratch. Each section is self-contained and buildable.
+
+================================================================================
+SECTION 1: PROJECT FOUNDATION & CORE TYPES
+================================================================================
+
+[x] 1.1 Create src/lib.rs - Library root with module declarations
+    - Declare all modules: config, cli, error, storage, delta, sync, signature
+
+[x] 1.2 Create src/error.rs - Custom error types
+    - HugeSyncError enum with thiserror
+    - Variants: Io, Network, Storage, Config, Delta, Conflict, Cancelled
+
+[x] 1.3 Create src/config.rs - Configuration management
+    - SyncConfig struct: delta_threshold, jobs, dry_run, delete, progress, etc.
+    - ConfigFile struct for ~/.config/hugesync/config.toml
+    - Load/save config with serde + toml
+    - Merge CLI args with file config (CLI wins)
+
+[x] 1.4 Create src/types.rs - Core domain types
+    - FileEntry: path, size, mtime, mode, is_dir
+    - SyncAction enum: Upload, Download, Delete, Skip, Delta
+    - SyncStats: files_scanned, bytes_transferred, bytes_saved, duration
+
+================================================================================
+SECTION 2: CLI INTERFACE
+================================================================================
+
+[x] 2.1 Create src/cli.rs - Clap argument definitions
+    - Main Cli struct with subcommands
+    - SyncCommand: source, destination, all flags from plan.md
+    - Flags: -a, -n, -v, -P, -j, --delete, --delta-threshold, --block-size
+
+[x] 2.2 Update src/main.rs - Entry point
+    - Parse CLI with clap
+    - Initialize tracing subscriber (JSON or pretty based on env)
+    - Build Config from CLI + config file
+    - Dispatch to sync command
+    - Handle Ctrl+C gracefully with tokio signal
+
+================================================================================
+SECTION 3: URI PARSING & STORAGE ABSTRACTION
+================================================================================
+
+[x] 3.1 Create src/uri.rs - URI parsing
+    - Location enum: Local(PathBuf), S3 { bucket, prefix }, Gcs { bucket, prefix }, Azure { container, prefix }
+    - Parse "s3://bucket/path", "gs://bucket/path", "az://container/path"
+    - Validate and normalize paths
+
+[x] 3.2 Create src/storage/mod.rs - Storage enum
+    - StorageBackend enum with Local and S3 variants
+    - Methods: list, get, put, delete, head
+    - Multipart: create_multipart_upload, upload_part, upload_part_copy, complete, abort
+
+[x] 3.3 Create src/storage/local.rs - Local filesystem backend
+    - Implement methods for LocalBackend
+    - Use jwalk for parallel directory walking
+    - Use memmap2 for reading large files
+    - Handle symlinks, permissions, hidden files
+
+[x] 3.4 Create src/storage/s3.rs - AWS S3 backend
+    - Implement methods for S3Backend
+    - Use aws-sdk-s3 for low-level operations
+    - Implement UploadPartCopy for delta stitching
+    - Handle multipart uploads with resume support
+    - Store POSIX metadata in x-amz-meta-* headers
+
+[ ] 3.5 Create src/storage/gcs.rs - Google Cloud Storage backend
+    - Implement StorageBackend for GcsBackend
+    - Use google-cloud-storage crate
+    - Implement compose for delta stitching
+
+[ ] 3.6 Create src/storage/azure.rs - Azure Blob Storage backend
+    - Implement StorageBackend for AzureBackend
+    - Use azure_storage_blobs crate
+    - Implement Block List for delta stitching
+
+================================================================================
+SECTION 4: SIGNATURE & DELTA ENGINE
+================================================================================
+
+[x] 4.1 Create src/signature/mod.rs - Signature types
+    - Signature struct: block_size, checksums: Vec<BlockChecksum>
+    - BlockChecksum: rolling_hash (u32), strong_hash (blake3, 32 bytes)
+    - SIGNATURE_MAGIC, VERSION for file format
+
+[x] 4.2 Create src/signature/generate.rs - Signature generation
+    - generate_signature(reader, block_size) -> Signature
+    - Use rolling checksums (Adler32-like)
+    - Use blake3 with rayon for parallel strong hashing
+    - Memory-map large files with memmap2
+
+[x] 4.3 Create src/signature/file.rs - .hssig file format
+    - Write signature to binary format
+    - Read signature from binary format
+    - Include source file ETag/mtime for staleness detection
+
+[x] 4.4 Create src/delta/mod.rs - Delta computation
+    - Delta struct: operations: Vec<DeltaOp>
+    - DeltaOp enum: Copy { src_offset, len }, Insert { data }
+
+[x] 4.5 Create src/delta/compute.rs - Delta algorithm
+    - compute_delta(local_file, remote_signature) -> Delta
+    - Use rolling hash matching
+    - Coalesce adjacent Copy operations
+    - Track bytes reused vs bytes new
+
+[x] 4.6 Create src/delta/coalesce.rs - S3-aware chunk coalescing
+    - Ensure no part < 5MB (S3 minimum)
+    - Merge small Insert operations
+    - Align operations to 5MB boundaries where possible
+
+================================================================================
+SECTION 5: SYNC ENGINE
+================================================================================
+
+[x] 5.1 Create src/sync/mod.rs - Sync orchestration
+    - SyncEngine struct with config, source, dest backends
+    - Main sync() method
+
+[x] 5.2 Create src/sync/scan.rs - Parallel file scanning
+    - Scan source and destination concurrently
+    - Use jwalk in spawn_blocking
+    - Build file tree with sizes, mtimes, hashes
+
+[x] 5.3 Create src/sync/diff.rs - Diff calculation
+    - Compare source and dest file lists
+    - Determine SyncAction for each file:
+        - New file -> Upload
+        - Missing file -> Delete (if --delete)
+        - Same mtime+size -> Skip
+        - Different -> Upload or Delta
+
+[x] 5.4 Create src/sync/plan.rs - Sync plan generation
+    - SyncPlan struct: Vec<PlannedAction>
+    - PlannedAction: file, action, estimated_bytes
+    - Calculate total bytes to transfer
+    - Calculate estimated savings from delta
+
+[x] 5.5 Create src/sync/execute.rs - Sync execution
+    - Execute plan with concurrency control (semaphore)
+    - For small files: direct upload/download
+    - For large files: delta sync pipeline
+    - Track progress, update stats
+    - Handle errors with retry logic
+
+[ ] 5.6 Create src/sync/delta_upload.rs - Delta upload pipeline
+    - Download remote .hssig (or generate if missing)
+    - Compute delta locally
+    - Initiate multipart upload
+    - Upload changed chunks
+    - Use UploadPartCopy for unchanged chunks
+    - Complete multipart upload
+    - Upload new .hssig
+
+[ ] 5.7 Create src/sync/conflict.rs - Conflict resolution
+    - Check ETag before upload (If-Match)
+    - Handle concurrent modifications
+    - --fail-on-conflict: abort
+    - Default: retry with fresh diff
+
+================================================================================
+SECTION 6: PROGRESS & UX
+================================================================================
+
+[x] 6.1 Create src/progress.rs - Progress tracking
+    - ProgressTracker with indicatif MultiProgress
+    - Overall progress bar (files)
+    - Current file progress bar (bytes)
+    - Delta savings display
+    - Dry-run summary output
+
+[ ] 6.2 Create src/format.rs - Output formatting
+    - Format file sizes (human_bytes)
+    - Format durations
+    - Format transfer rates
+    - Dry-run report format
+
+================================================================================
+SECTION 7: RESUME & RELIABILITY
+================================================================================
+
+[ ] 7.1 Create src/resume.rs - Resume state management
+    - ResumeState struct: upload_id, completed_parts, file_path
+    - Persist to ~/.cache/hugesync/uploads/<hash>.json
+    - Load on startup, resume incomplete uploads
+    - Clean up after successful completion
+
+[ ] 7.2 Create src/retry.rs - Retry logic
+    - Exponential backoff with jitter
+    - Configurable max retries
+    - Distinguish retryable vs fatal errors
+
+================================================================================
+SECTION 8: INTEGRATION & TESTING
+================================================================================
+
+[ ] 8.1 Create tests/integration_local.rs
+    - Test local-to-local sync
+    - Test file creation, modification, deletion
+    - Test filtering (include/exclude)
+
+[ ] 8.2 Create tests/integration_s3.rs
+    - Test local-to-S3 sync (requires localstack or minio)
+    - Test delta upload
+    - Test multipart upload/resume
+    - Test UploadPartCopy functionality
+
+[ ] 8.3 Create tests/delta_tests.rs
+    - Test signature generation
+    - Test delta computation
+    - Test chunk coalescing
+    - Verify byte savings
+
+[ ] 8.4 Create benches/scan_bench.rs
+    - Benchmark jwalk vs walkdir
+    - Benchmark on large directory trees
+
+[ ] 8.5 Create benches/delta_bench.rs
+    - Benchmark signature generation
+    - Benchmark delta computation
+    - Measure throughput on large files
+
+================================================================================
+SECTION 9: POLISH & DOCUMENTATION
+================================================================================
+
+[ ] 9.1 Update README.md
+    - Installation instructions
+    - Quick start examples
+    - Configuration reference
+    - Performance tips
+
+[ ] 9.2 Create CHANGELOG.md
+    - Initial release notes
+
+[ ] 9.3 Create examples/
+    - examples/basic_sync.rs
+    - examples/delta_demo.rs
+
+================================================================================
+IMPLEMENTATION ORDER (RECOMMENDED)
+================================================================================
+
+Phase A - Foundation (Days 1-2):
+  [x] 1.1 src/lib.rs
+  [x] 1.2 src/error.rs
+  [x] 1.3 src/config.rs
+  [x] 1.4 src/types.rs
+  [x] 2.1 src/cli.rs
+  [x] 2.2 src/main.rs (basic)
+
+Phase B - Local Storage (Days 3-4):
+  [x] 3.1 src/uri.rs
+  [x] 3.2 src/storage/mod.rs (enum)
+  [x] 3.3 src/storage/local.rs
+  [x] 5.2 src/sync/scan.rs (local only)
+
+Phase C - Basic Sync (Days 5-7):
+  [x] 5.1 src/sync/mod.rs
+  [x] 5.3 src/sync/diff.rs
+  [x] 5.4 src/sync/plan.rs
+  [x] 5.5 src/sync/execute.rs (simple upload)
+  [x] 6.1 src/progress.rs
+  [ ] Test: local-to-local sync works
+
+Phase D - S3 Backend (Days 8-10):
+  [x] 3.4 src/storage/s3.rs
+  [ ] 7.2 src/retry.rs
+  [ ] Test: local-to-S3 sync works (full files)
+
+Phase E - Delta Engine (Days 11-15):
+  [x] 4.1 src/signature/mod.rs
+  [x] 4.2 src/signature/generate.rs
+  [x] 4.3 src/signature/file.rs
+  [x] 4.4 src/delta/mod.rs
+  [x] 4.5 src/delta/compute.rs
+  [x] 4.6 src/delta/coalesce.rs
+  [ ] 5.6 src/sync/delta_upload.rs
+  [ ] Test: delta sync reduces bandwidth
+
+Phase F - Production Features (Days 16-20):
+  [ ] 5.7 src/sync/conflict.rs
+  [ ] 7.1 src/resume.rs
+  [ ] 3.5 src/storage/gcs.rs
+  [ ] 3.6 src/storage/azure.rs
+
+Phase G - Polish (Days 21-25):
+  [ ] 8.* All tests
+  [ ] 9.* Documentation
+  [ ] Performance tuning
+  [ ] Release preparation
+
+================================================================================
+KEY DESIGN DECISIONS
+================================================================================
+
+1. Block Size: Default 5MB (configurable 64KB-5MB via --block-size)
+   - 5MB aligns with S3 minimum part size
+   - Smaller blocks = more granular deltas but more overhead
+   - Range: 64KB (65536) to 5MB (5242880)
+2. Parallelism: Use rayon for CPU-bound, tokio for I/O-bound
+3. Memory: Stream large files, never load fully into memory
+4. Sidecar Location: Same path as file with .hssig extension
+5. Config Priority: CLI > env vars > config file > defaults
+
+================================================================================

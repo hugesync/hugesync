@@ -1,0 +1,83 @@
+[package]
+name = "hugesync"
+version = "0.0.1"
+edition = "2021"
+description = "A Cloud-Era Delta Synchronization Tool"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hugesync/hugesync"
+keywords = ["sync", "s3", "delta", "rsync", "cloud"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+# Core Runtime & Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+num_cpus = "1"
+rayon = "1"
+bytes = "1"
+
+# Filesystem & Walking
+jwalk = "0.8"
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+memmap2 = "0.9"
+ignore = "0.4"
+
+# Cloud & Network - AWS
+object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+
+# Cloud & Network - GCP
+google-cloud-storage = "1.5"
+
+# Cloud & Network - Azure
+azure_storage = "0.21"
+azure_storage_blobs = "0.21"
+
+# HTTP Client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+url = "2"
+
+# Delta & Cryptography
+fast_rsync = "0.2"
+blake3 = { version = "1", features = ["rayon", "mmap"] }
+hex = "0.4"
+base64 = "0.22"
+
+# CLI & UX
+clap = { version = "4", features = ["derive", "env"] }
+indicatif = "0.18"
+console = "0.16"
+dialoguer = "0.12"
+human_bytes = "0.4"
+
+# Observability & Error Handling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+thiserror = "2"
+
+# Configuration & Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+dirs = "6"
+
+# SSH Support
+openssh = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = "0.8"
+tokio-test = "0.4"
+
+[[bin]]
+name = "hugesync"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
