@@ -38,11 +38,10 @@ pub enum Error {
     Delta { message: String },
 
     /// Conflict detected (remote file changed during sync)
-    #[error("Conflict: {path} was modified externally (expected ETag: {expected}, got: {actual})")]
+    #[error("Conflict at {path}: {message}")]
     Conflict {
-        path: PathBuf,
-        expected: String,
-        actual: String,
+        path: String,
+        message: String,
     },
 
     /// Operation was cancelled

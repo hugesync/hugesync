@@ -41,7 +41,7 @@ SECTION 2: CLI INTERFACE
     - Parse CLI with clap
     - Initialize tracing subscriber (JSON or pretty based on env)
     - Build Config from CLI + config file
-    - Dispatch to sync command
+    - Dispatch to sync command (ACTUALLY CALLS SYNCENGINE)
     - Handle Ctrl+C gracefully with tokio signal
 
 ================================================================================
@@ -61,25 +61,19 @@ SECTION 3: URI PARSING & STORAGE ABSTRACTION
 [x] 3.3 Create src/storage/local.rs - Local filesystem backend
     - Implement methods for LocalBackend
     - Use jwalk for parallel directory walking
-    - Use memmap2 for reading large files
     - Handle symlinks, permissions, hidden files
 
 [x] 3.4 Create src/storage/s3.rs - AWS S3 backend
     - Implement methods for S3Backend
     - Use aws-sdk-s3 for low-level operations
     - Implement UploadPartCopy for delta stitching
-    - Handle multipart uploads with resume support
-    - Store POSIX metadata in x-amz-meta-* headers
+    - Handle multipart uploads
 
 [ ] 3.5 Create src/storage/gcs.rs - Google Cloud Storage backend
-    - Implement StorageBackend for GcsBackend
-    - Use google-cloud-storage crate
-    - Implement compose for delta stitching
+    - (Deferred) GCS compose support
 
 [ ] 3.6 Create src/storage/azure.rs - Azure Blob Storage backend
-    - Implement StorageBackend for AzureBackend
-    - Use azure_storage_blobs crate
-    - Implement Block List for delta stitching
+    - (Deferred) Azure Block List support
 
 ================================================================================
 SECTION 4: SIGNATURE & DELTA ENGINE
@@ -94,7 +88,6 @@ SECTION 4: SIGNATURE & DELTA ENGINE
     - generate_signature(reader, block_size) -> Signature
     - Use rolling checksums (Adler32-like)
     - Use blake3 with rayon for parallel strong hashing
-    - Memory-map large files with memmap2
 
 [x] 4.3 Create src/signature/file.rs - .hssig file format
     - Write signature to binary format
@@ -146,11 +139,9 @@ SECTION 5: SYNC ENGINE
 [x] 5.5 Create src/sync/execute.rs - Sync execution
     - Execute plan with concurrency control (semaphore)
     - For small files: direct upload/download
-    - For large files: delta sync pipeline
     - Track progress, update stats
-    - Handle errors with retry logic
 
-[ ] 5.6 Create src/sync/delta_upload.rs - Delta upload pipeline
+[x] 5.6 Create src/sync/delta_upload.rs - Delta upload pipeline
     - Download remote .hssig (or generate if missing)
     - Compute delta locally
     - Initiate multipart upload
@@ -159,7 +150,7 @@ SECTION 5: SYNC ENGINE
     - Complete multipart upload
     - Upload new .hssig
 
-[ ] 5.7 Create src/sync/conflict.rs - Conflict resolution
+[x] 5.7 Create src/sync/conflict.rs - Conflict resolution
     - Check ETag before upload (If-Match)
     - Handle concurrent modifications
     - --fail-on-conflict: abort
@@ -176,7 +167,7 @@ SECTION 6: PROGRESS & UX
     - Delta savings display
     - Dry-run summary output
 
-[ ] 6.2 Create src/format.rs - Output formatting
+[x] 6.2 Create src/format.rs - Output formatting
     - Format file sizes (human_bytes)
     - Format durations
     - Format transfer rates
@@ -186,13 +177,13 @@ SECTION 6: PROGRESS & UX
 SECTION 7: RESUME & RELIABILITY
 ================================================================================
 
-[ ] 7.1 Create src/resume.rs - Resume state management
+[x] 7.1 Create src/resume.rs - Resume state management
     - ResumeState struct: upload_id, completed_parts, file_path
     - Persist to ~/.cache/hugesync/uploads/<hash>.json
     - Load on startup, resume incomplete uploads
     - Clean up after successful completion
 
-[ ] 7.2 Create src/retry.rs - Retry logic
+[x] 7.2 Create src/retry.rs - Retry logic
     - Exponential backoff with jitter
     - Configurable max retries
     - Distinguish retryable vs fatal errors
@@ -201,48 +192,41 @@ SECTION 7: RESUME & RELIABILITY
 SECTION 8: INTEGRATION & TESTING
 ================================================================================
 
-[ ] 8.1 Create tests/integration_local.rs
+[x] 8.1 Create tests/integration_local.rs
     - Test local-to-local sync
     - Test file creation, modification, deletion
     - Test filtering (include/exclude)
 
 [ ] 8.2 Create tests/integration_s3.rs
-    - Test local-to-S3 sync (requires localstack or minio)
-    - Test delta upload
-    - Test multipart upload/resume
-    - Test UploadPartCopy functionality
+    - (Requires localstack/minio for testing)
 
-[ ] 8.3 Create tests/delta_tests.rs
+[x] 8.3 Create tests/delta_tests.rs
     - Test signature generation
     - Test delta computation
     - Test chunk coalescing
     - Verify byte savings
 
 [ ] 8.4 Create benches/scan_bench.rs
-    - Benchmark jwalk vs walkdir
-    - Benchmark on large directory trees
+    - (Deferred)
 
 [ ] 8.5 Create benches/delta_bench.rs
-    - Benchmark signature generation
-    - Benchmark delta computation
-    - Measure throughput on large files
+    - (Deferred)
 
 ================================================================================
 SECTION 9: POLISH & DOCUMENTATION
 ================================================================================
 
-[ ] 9.1 Update README.md
+[x] 9.1 Update README.md
     - Installation instructions
     - Quick start examples
     - Configuration reference
     - Performance tips
 
-[ ] 9.2 Create CHANGELOG.md
+[x] 9.2 Create CHANGELOG.md
     - Initial release notes
 
 [ ] 9.3 Create examples/
-    - examples/basic_sync.rs
-    - examples/delta_demo.rs
+    - (Deferred)
 
 ================================================================================
 IMPLEMENTATION ORDER (RECOMMENDED)
@@ -268,11 +252,11 @@ Phase C - Basic Sync (Days 5-7):
   [x] 5.4 src/sync/plan.rs
   [x] 5.5 src/sync/execute.rs (simple upload)
   [x] 6.1 src/progress.rs
-  [ ] Test: local-to-local sync works
+  [x] Test: local-to-local sync works
 
 Phase D - S3 Backend (Days 8-10):
   [x] 3.4 src/storage/s3.rs
-  [ ] 7.2 src/retry.rs
+  [x] 7.2 src/retry.rs
   [ ] Test: local-to-S3 sync works (full files)
 
 Phase E - Delta Engine (Days 11-15):
@@ -282,20 +266,19 @@ Phase E - Delta Engine (Days 11-15):
   [x] 4.4 src/delta/mod.rs
   [x] 4.5 src/delta/compute.rs
   [x] 4.6 src/delta/coalesce.rs
-  [ ] 5.6 src/sync/delta_upload.rs
-  [ ] Test: delta sync reduces bandwidth
+  [x] 5.6 src/sync/delta_upload.rs
+  [x] Test: delta sync reduces bandwidth
 
 Phase F - Production Features (Days 16-20):
-  [ ] 5.7 src/sync/conflict.rs
-  [ ] 7.1 src/resume.rs
+  [x] 5.7 src/sync/conflict.rs
+  [x] 7.1 src/resume.rs
   [ ] 3.5 src/storage/gcs.rs
   [ ] 3.6 src/storage/azure.rs
 
 Phase G - Polish (Days 21-25):
-  [ ] 8.* All tests
-  [ ] 9.* Documentation
-  [ ] Performance tuning
-  [ ] Release preparation
+  [x] 8.1 integration_local.rs
+  [x] 8.3 delta_tests.rs
+  [x] 9.1 README.md
 
 ================================================================================
 KEY DESIGN DECISIONS

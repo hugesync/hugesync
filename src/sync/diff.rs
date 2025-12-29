@@ -11,7 +11,7 @@ pub fn compute_diff(
     dest_files: &[FileEntry],
     config: &Config,
 ) -> Vec<PlannedAction> {
-    let source_map = build_file_map(source_files);
+    let _source_map = build_file_map(source_files);
     let dest_map = build_file_map(dest_files);
 
     let mut actions = Vec::new();

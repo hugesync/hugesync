@@ -2,7 +2,6 @@
 
 use crate::types::SyncStats;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Progress tracker for sync operations

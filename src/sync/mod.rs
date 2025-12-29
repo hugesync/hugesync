@@ -1,5 +1,7 @@
 //! Sync engine and orchestration
 
+pub mod conflict;
+pub mod delta_upload;
 pub mod diff;
 pub mod execute;
 pub mod plan;

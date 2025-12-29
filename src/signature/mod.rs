@@ -1,10 +1,10 @@
 //! Signature generation and parsing for delta sync
 
-mod file;
-mod generate;
+pub mod file;
+pub mod generate;
 
-pub use file::{read_signature, write_signature};
-pub use generate::generate_signature;
+pub use file::{read_signature, read_signature_from_bytes, write_signature, write_signature_to_bytes};
+pub use generate::{generate_signature, generate_signature_from_bytes};
 
 use serde::{Deserialize, Serialize};
 

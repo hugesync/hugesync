@@ -7,7 +7,10 @@ pub mod cli;
 pub mod config;
 pub mod delta;
 pub mod error;
+pub mod format;
 pub mod progress;
+pub mod resume;
+pub mod retry;
 pub mod signature;
 pub mod storage;
 pub mod sync;
@@ -17,3 +20,4 @@ pub mod uri;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use types::*;
+

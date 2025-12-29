@@ -6,7 +6,6 @@ pub mod s3;
 use crate::error::Result;
 use crate::types::FileEntry;
 use bytes::Bytes;
-use futures::stream::{self, StreamExt};
 use std::path::PathBuf;
 
 pub use local::LocalBackend;

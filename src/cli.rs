@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 /// HugeSync - A Cloud-Era Delta Synchronization Tool
 #[derive(Parser, Debug)]
-#[command(name = "hugesync")]
+#[command(name = "hsync")]
 #[command(version, about, long_about = None)]
 pub struct Cli {
     /// Increase logging verbosity (-v, -vv, -vvv)

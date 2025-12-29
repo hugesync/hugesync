@@ -59,7 +59,7 @@ pub struct PlanCounts {
 }
 
 /// Generate a sync plan from planned actions
-pub fn generate_plan(actions: Vec<PlannedAction>, config: &Config) -> SyncPlan {
+pub fn generate_plan(actions: Vec<PlannedAction>, _config: &Config) -> SyncPlan {
     let mut plan = SyncPlan::new();
 
     for mut action in actions {

@@ -1,13 +1,11 @@
 //! Signature generation using rolling checksums and BLAKE3
 
 use super::{BlockChecksum, Signature};
-use crate::config::DEFAULT_BLOCK_SIZE;
 use crate::error::{Error, Result};
-use blake3::Hasher;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::Path;
 
 /// Rolling checksum implementation (Adler32-like)
@@ -66,8 +64,13 @@ fn generate_signature_mmap(path: &Path, block_size: usize, file_size: u64) -> Re
         })
         .collect();
 
+    // Compute file hash for etag (using BLAKE3 of entire file)
+    let file_hash = blake3::hash(&mmap);
+    let etag = hex::encode(&file_hash.as_bytes()[..16]); // Use first 16 bytes for shorter etag
+
     let mut sig = Signature::new(block_size, file_size);
     sig.blocks = blocks;
+    sig.source_etag = Some(etag);
 
     Ok(sig)
 }
@@ -80,6 +83,7 @@ fn generate_signature_read(path: &Path, block_size: usize, file_size: u64) -> Re
     let mut buffer = vec![0u8; block_size];
     let mut offset = 0u64;
     let mut index = 0usize;
+    let mut file_hasher = blake3::Hasher::new();
 
     loop {
         let bytes_read = file.read(&mut buffer).map_err(|e| Error::io("reading file", e))?;
@@ -92,6 +96,9 @@ fn generate_signature_read(path: &Path, block_size: usize, file_size: u64) -> Re
         let rolling = rolling_checksum(chunk);
         let strong = blake3::hash(chunk);
 
+        // Update file hash for etag
+        file_hasher.update(chunk);
+
         sig.blocks.push(BlockChecksum::new(
             index,
             offset,
@@ -103,6 +110,10 @@ fn generate_signature_read(path: &Path, block_size: usize, file_size: u64) -> Re
         offset += bytes_read as u64;
         index += 1;
     }
+
+    // Set etag from file hash
+    let file_hash = file_hasher.finalize();
+    sig.source_etag = Some(hex::encode(&file_hash.as_bytes()[..16]));
 
     Ok(sig)
 }
@@ -125,6 +136,10 @@ pub fn generate_signature_from_bytes(data: &[u8], block_size: usize) -> Signatur
             *strong.as_bytes(),
         ));
     }
+
+    // Set etag from data hash
+    let data_hash = blake3::hash(data);
+    sig.source_etag = Some(hex::encode(&data_hash.as_bytes()[..16]));
 
     sig
 }

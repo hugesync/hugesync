@@ -1,7 +1,7 @@
 //! Delta computation and types
 
 mod compute;
-mod coalesce;
+pub mod coalesce;
 
 pub use compute::compute_delta;
 pub use coalesce::coalesce_operations;

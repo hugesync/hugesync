@@ -8,7 +8,6 @@ use aws_sdk_s3::Client;
 use bytes::Bytes;
 use futures::StreamExt;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 /// AWS S3 storage backend
 #[derive(Clone)]

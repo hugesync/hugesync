@@ -8,6 +8,14 @@ repository = "https://github.com/hugesync/hugesync"
 keywords = ["sync", "s3", "delta", "rsync", "cloud"]
 categories = ["command-line-utilities", "filesystem"]
 
+[[bin]]
+name = "hsync"
+path = "src/main.rs"
+
+[lib]
+name = "hugesync"
+path = "src/lib.rs"
+
 [dependencies]
 # Core Runtime & Async
 tokio = { version = "1", features = ["full"] }
@@ -70,10 +78,6 @@ openssh = "0.11"
 tempfile = "3"
 criterion = "0.8"
 tokio-test = "0.4"
-
-[[bin]]
-name = "hugesync"
-path = "src/main.rs"
 
 [profile.release]
 lto = true

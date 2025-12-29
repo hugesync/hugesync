@@ -1,7 +1,6 @@
 //! Local filesystem storage backend
 
 use crate::error::{Error, Result};
-use crate::storage::CompletedPart;
 use crate::types::FileEntry;
 use bytes::Bytes;
 use std::os::unix::fs::MetadataExt;
@@ -20,6 +19,11 @@ impl LocalBackend {
     /// Create a new local backend with the given root path
     pub fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    /// Get the root path for this backend
+    pub fn root(&self) -> &PathBuf {
+        &self.root
     }
 
     /// Resolve a relative path to an absolute path
