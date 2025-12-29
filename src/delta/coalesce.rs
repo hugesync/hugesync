@@ -166,99 +166,117 @@ impl CoalescedOp {
 /// guaranteed to meet S3's requirements:
 /// - All parts except the last must be >= 5MB
 /// - Small inserts are padded with source data if necessary
+/// Prepare operations for S3 multipart upload
+/// 
+/// This function converts coalesced operations into S3 parts that are strictly compliant
+/// with the 5MB minimum part size requirement (except for the last part).
+/// It uses an accumulating buffer to merge small operations and "steals" data from
+/// large copy operations to satisfy padding requirements.
 pub fn prepare_for_s3_upload(
     ops: &[CoalescedOp],
     source_data: &[u8],
     _target_size: u64,
 ) -> Vec<S3Part> {
     let mut parts = Vec::new();
-    let mut part_number = 1i32;
+    let mut accumulator = Vec::new();
+    let mut part_number = 1;
     let mut target_offset = 0u64;
 
-    for (i, op) in ops.iter().enumerate() {
-        let is_last = i == ops.len() - 1;
-        let min_size = if is_last { 0 } else { S3_MIN_PART_SIZE };
+    // Helper to emit an upload part
+    let emit_upload = |data: Vec<u8>, parts: &mut Vec<S3Part>, p_num: &mut i32, t_off: &mut u64| {
+        let len = data.len() as u64;
+        parts.push(S3Part {
+            part_number: *p_num,
+            content: PartContent::Upload { data },
+            target_offset: *t_off,
+        });
+        *p_num += 1;
+        *t_off += len;
+    };
 
+    for op in ops {
         match op {
-            CoalescedOp::Copy { source_offset, length } => {
-                if *length >= min_size || is_last {
-                    parts.push(S3Part {
-                        part_number,
-                        content: PartContent::CopyRange {
-                            source_offset: *source_offset,
-                            length: *length,
-                        },
-                        target_offset,
-                    });
-                    target_offset += *length;
-                    part_number += 1;
-                } else {
-                    // Copy is too small - we need to convert to an insert
-                    // by reading the data and padding it
-                    let start = *source_offset as usize;
-                    let end = start + *length as usize;
-                    let data = if end <= source_data.len() {
-                        source_data[start..end].to_vec()
-                    } else {
-                        // Can't read source data - this is a problem
-                        // Fall back to just the data we have
-                        vec![0u8; *length as usize]
-                    };
-                    
-                    // Pad to minimum size
-                    let padded = pad_to_min_size(data, min_size as usize);
-                    
-                    parts.push(S3Part {
-                        part_number,
-                        content: PartContent::Upload { data: padded },
-                        target_offset,
-                    });
-                    target_offset += *length;
-                    part_number += 1;
+            CoalescedOp::Insert { data } => {
+                accumulator.extend_from_slice(data);
+                // Flush if we have enough data
+                if accumulator.len() as u64 >= S3_MIN_PART_SIZE {
+                    emit_upload(std::mem::take(&mut accumulator), &mut parts, &mut part_number, &mut target_offset);
                 }
             }
-            CoalescedOp::Insert { data } => {
-                let len = data.len() as u64;
-                if len >= min_size || is_last {
-                    parts.push(S3Part {
-                        part_number,
-                        content: PartContent::Upload { data: data.clone() },
-                        target_offset,
-                    });
-                    target_offset += len;
-                    part_number += 1;
-                } else {
-                    // Insert is too small - pad with zeros or read ahead
-                    let padded = pad_to_min_size(data.clone(), min_size as usize);
+            CoalescedOp::Copy { source_offset, length } => {
+                let mut current_offset = *source_offset;
+                let mut current_length = *length;
+
+                // If we have data in accumulator, try to fill it to 5MB using this copy
+                if !accumulator.is_empty() {
+                    let needed = S3_MIN_PART_SIZE.saturating_sub(accumulator.len() as u64);
                     
-                    parts.push(S3Part {
-                        part_number,
-                        content: PartContent::Upload { data: padded },
-                        target_offset,
-                    });
-                    target_offset += len;
-                    part_number += 1;
+                    if current_length < needed {
+                        // Not enough to fill accumulator, just append everything
+                        let data = read_source(source_data, current_offset, current_length);
+                        accumulator.extend(data);
+                        current_length = 0;
+                    } else {
+                        // Fill accumulator and emit
+                        let data = read_source(source_data, current_offset, needed);
+                        accumulator.extend(data);
+                        emit_upload(std::mem::take(&mut accumulator), &mut parts, &mut part_number, &mut target_offset);
+                        current_offset += needed;
+                        current_length -= needed;
+                    }
+                }
+
+                // Now handle the remaining copy
+                if current_length > 0 {
+                    if current_length >= S3_MIN_PART_SIZE {
+                        // Large enough to be its own part(s)
+                        parts.push(S3Part {
+                            part_number,
+                            content: PartContent::CopyRange {
+                                source_offset: current_offset,
+                                length: current_length,
+                            },
+                            target_offset,
+                        });
+                        part_number += 1;
+                        target_offset += current_length;
+
+                    } else {
+                        // Too small to be a part, add to accumulator
+                        let data = read_source(source_data, current_offset, current_length);
+                        accumulator.extend(data);
+                    }
                 }
             }
         }
     }
 
+    // Flush any remaining data as the last part
+    if !accumulator.is_empty() {
+        emit_upload(accumulator, &mut parts, &mut part_number, &mut target_offset);
+    }
+    
     parts
 }
 
-/// Pad data to minimum size
-fn pad_to_min_size(data: Vec<u8>, min_size: usize) -> Vec<u8> {
-    if data.len() < min_size {
-        // In a real implementation, we'd read adjacent source data
-        // For now, we log a warning - the caller should handle this
-        tracing::warn!(
-            current_size = data.len(),
-            min_size = min_size,
-            "Part is too small for S3, needs padding"
-        );
+/// Helper to safely read from source data
+fn read_source(source: &[u8], offset: u64, len: u64) -> Vec<u8> {
+    let start = offset as usize;
+    let end = (offset + len) as usize;
+    if start >= source.len() {
+        return vec![0u8; len as usize]; // Should not happen with valid delta
+    }
+    let valid_end = std::cmp::min(end, source.len());
+    let mut data = source[start..valid_end].to_vec();
+    if data.len() < len as usize {
+        // Pad with zeros if we ran out of source data (unexpected)
+        data.resize(len as usize, 0);
     }
     data
 }
+
+/// Pad data to minimum size
+
 
 /// An S3-compatible part
 #[derive(Debug, Clone)]

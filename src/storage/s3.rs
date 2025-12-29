@@ -270,7 +270,7 @@ impl S3Backend {
 
         let etag = output
             .e_tag()
-            .map(|s| s.trim_matches('"').to_string())
+            .map(|s| s.to_string())
             .ok_or_else(|| Error::MultipartUpload {
                 message: "no ETag returned for part".to_string(),
                 upload_id: Some(upload_id.to_string()),
@@ -311,7 +311,7 @@ impl S3Backend {
         let etag = output
             .copy_part_result()
             .and_then(|r| r.e_tag())
-            .map(|s| s.trim_matches('"').to_string())
+            .map(|s| s.to_string())
             .ok_or_else(|| Error::MultipartUpload {
                 message: "no ETag returned for copied part".to_string(),
                 upload_id: Some(upload_id.to_string()),

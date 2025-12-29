@@ -139,18 +139,14 @@ impl RollingChecksum {
 }
 
 /// Optimized delta computation using true O(1) rolling checksum
-pub fn compute_delta_rolling<R: Read>(mut local_reader: R, remote_sig: &Signature) -> crate::error::Result<Delta> {
-    let mut local_data = Vec::new();
-    local_reader.read_to_end(&mut local_data)
-        .map_err(|e| crate::error::Error::io("reading local file", e))?;
-
+pub fn compute_delta_rolling(local_data: &[u8], remote_sig: &Signature) -> crate::error::Result<Delta> {
     let local_len = local_data.len() as u64;
     let block_size = remote_sig.block_size;
 
     if local_data.len() < block_size {
         // File is smaller than block size, can't match any blocks
         let mut delta = Delta::new(local_len);
-        delta.add_insert(local_data);
+        delta.add_insert(local_data.to_vec());
         return Ok(delta);
     }
 
@@ -225,7 +221,7 @@ pub fn compute_delta_rolling<R: Read>(mut local_reader: R, remote_sig: &Signatur
 
 /// Compute delta from byte slices (for testing)
 pub fn compute_delta_from_bytes(local: &[u8], remote_sig: &Signature) -> crate::error::Result<Delta> {
-    compute_delta_rolling(std::io::Cursor::new(local), remote_sig)
+    compute_delta_rolling(local, remote_sig)
 }
 
 #[cfg(test)]

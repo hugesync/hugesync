@@ -144,7 +144,7 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(_) => false,
             StorageBackend::S3(_) => true,
-            StorageBackend::Gcs(_) => true,  // GCS compose can copy ranges
+            StorageBackend::Gcs(_) => false,  // GCS requires XML API for server-side copy
             StorageBackend::Azure(_) => true, // Azure can copy blocks
         }
     }

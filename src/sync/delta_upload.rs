@@ -56,12 +56,17 @@ pub async fn delta_upload(
         }
     };
 
-    // Step 3: Read local file and compute delta using OPTIMIZED rolling algorithm
-    let local_data = std::fs::read(local_path)
-        .map_err(|e| Error::io("reading local file", e))?;
+    // Step 3: Read local file using memory mapping to avoid OOM
+    let file = std::fs::File::open(local_path)
+        .map_err(|e| Error::io("opening local file", e))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| Error::io("mmapping local file", e))?;
+    
+    // Explicitly treat mmap as slice
+    let local_data = &mmap[..];
     
     // Use the O(N) rolling checksum algorithm
-    let delta = compute_delta_rolling(std::io::Cursor::new(&local_data), &remote_sig)?;
+    let delta = compute_delta_rolling(local_data, &remote_sig)?;
 
     // Step 4: Check if delta is beneficial
     if !delta.is_beneficial() {
