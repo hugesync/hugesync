@@ -2,19 +2,37 @@
 //!
 //! This backend provides SFTP-based file transfers using the russh library,
 //! which is a pure Rust SSH implementation that works across all platforms.
+//!
+//! ## Connection Pooling
+//!
+//! To enable concurrent transfers with `-j/--jobs`, this backend uses a connection
+//! pool. Each concurrent operation gets its own SFTP connection, allowing true
+//! parallelism instead of serializing all operations through a single connection.
 
 use crate::bufpool::global as bufpool;
 use crate::error::{Error, Result};
 use crate::storage::ByteStream;
 use crate::types::FileEntry;
 use bytes::Bytes;
+use crossbeam_queue::ArrayQueue;
 use futures::StreamExt;
 use russh::client::{self, Config, Handle, Handler};
 use russh::keys::ssh_key::PublicKey;
+use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+
+/// Escape a string for safe use in shell commands
+fn shell_escape(s: &str) -> String {
+    // Use single quotes and escape any single quotes within
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Default maximum connections in the pool
+const DEFAULT_MAX_CONNECTIONS: usize = 8;
 
 /// SSH client handler for russh
 struct SshHandler;
@@ -32,82 +50,224 @@ impl Handler for SshHandler {
 /// SFTP session wrapper
 struct SftpConnection {
     session: SftpSession,
-    #[allow(dead_code)]
     handle: Handle<SshHandler>,
 }
 
+/// Connection parameters for creating new connections
+#[derive(Clone)]
+struct ConnectionParams {
+    user: String,
+    host: String,
+    port: u16,
+}
+
+/// A pooled SFTP connection that returns to the pool when dropped
+pub struct PooledConnection {
+    conn: Option<SftpConnection>,
+    pool: Arc<SshConnectionPool>,
+}
+
+impl PooledConnection {
+    /// Get the SFTP session
+    pub fn session(&self) -> &SftpSession {
+        &self.conn.as_ref().unwrap().session
+    }
+
+    /// Get the SSH handle for command execution
+    fn handle(&self) -> &Handle<SshHandler> {
+        &self.conn.as_ref().unwrap().handle
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool.return_connection(conn);
+        }
+    }
+}
+
+/// SSH connection pool for concurrent transfers
+struct SshConnectionPool {
+    /// Available connections
+    available: ArrayQueue<SftpConnection>,
+    /// Semaphore to limit total connections
+    semaphore: Semaphore,
+    /// Connection parameters for creating new connections
+    params: ConnectionParams,
+    /// Number of active connections (created but not yet returned)
+    active_count: AtomicUsize,
+    /// Total connections created (for stats)
+    total_created: AtomicUsize,
+}
+
+impl SshConnectionPool {
+    /// Create a new connection pool
+    fn new(params: ConnectionParams, max_connections: usize) -> Self {
+        Self {
+            available: ArrayQueue::new(max_connections),
+            semaphore: Semaphore::new(max_connections),
+            params,
+            active_count: AtomicUsize::new(0),
+            total_created: AtomicUsize::new(0),
+        }
+    }
+
+    /// Acquire a connection from the pool
+    async fn acquire(self: &Arc<Self>) -> Result<PooledConnection> {
+        // Wait for a permit (limits total concurrent connections)
+        let _permit = self.semaphore.acquire().await.map_err(|_| Error::Ssh {
+            message: "Connection pool closed".to_string(),
+        })?;
+
+        // We have a permit, so we're allowed to have a connection
+        // Try to get an existing connection first
+        if let Some(conn) = self.available.pop() {
+            return Ok(PooledConnection {
+                conn: Some(conn),
+                pool: Arc::clone(self),
+            });
+        }
+
+        // No available connection, create a new one
+        self.active_count.fetch_add(1, Ordering::Relaxed);
+        self.total_created.fetch_add(1, Ordering::Relaxed);
+
+        let conn = create_sftp_connection(&self.params).await?;
+
+        tracing::debug!(
+            total_created = self.total_created.load(Ordering::Relaxed),
+            active = self.active_count.load(Ordering::Relaxed),
+            "Created new SSH connection"
+        );
+
+        Ok(PooledConnection {
+            conn: Some(conn),
+            pool: Arc::clone(self),
+        })
+    }
+
+    /// Return a connection to the pool
+    fn return_connection(&self, conn: SftpConnection) {
+        // Try to return to pool
+        if self.available.push(conn).is_err() {
+            // Pool is full, drop the connection
+            tracing::debug!("SSH connection pool full, dropping connection");
+        }
+        self.active_count.fetch_sub(1, Ordering::Relaxed);
+
+        // Release the semaphore permit
+        self.semaphore.add_permits(1);
+    }
+
+    /// Get pool statistics
+    #[allow(dead_code)]
+    fn stats(&self) -> (usize, usize, usize) {
+        (
+            self.available.len(),
+            self.active_count.load(Ordering::Relaxed),
+            self.total_created.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Create a new SFTP connection
+async fn create_sftp_connection(params: &ConnectionParams) -> Result<SftpConnection> {
+    let config = Arc::new(Config::default());
+
+    // Connect to SSH server
+    let mut handle = client::connect(config, (params.host.as_str(), params.port), SshHandler)
+        .await
+        .map_err(|e| Error::Ssh {
+            message: format!("Failed to connect to {}:{}: {}", params.host, params.port, e),
+        })?;
+
+    // Authenticate
+    let authenticated = try_authenticate(&mut handle, &params.user).await?;
+    if !authenticated {
+        return Err(Error::Ssh {
+            message: format!("Authentication failed for {}@{}", params.user, params.host),
+        });
+    }
+
+    // Open SFTP channel
+    let channel = handle.channel_open_session().await.map_err(|e| Error::Ssh {
+        message: format!("Failed to open SSH channel: {}", e),
+    })?;
+
+    channel.request_subsystem(true, "sftp").await.map_err(|e| Error::Ssh {
+        message: format!("Failed to request SFTP subsystem: {}", e),
+    })?;
+
+    let session = SftpSession::new(channel.into_stream()).await.map_err(|e| Error::Ssh {
+        message: format!("Failed to initialize SFTP session: {}", e),
+    })?;
+
+    Ok(SftpConnection { session, handle })
+}
+
 /// SSH/SFTP storage backend using pure Rust russh library
+///
+/// This backend uses a connection pool to support concurrent transfers.
+/// The pool size can be configured to match the `-j/--jobs` parameter.
 #[derive(Clone)]
 pub struct SshBackend {
-    /// Shared SFTP connection
-    sftp: Arc<Mutex<SftpConnection>>,
+    /// Connection pool for concurrent operations
+    pool: Arc<SshConnectionPool>,
     /// Remote base path
     path: String,
-    /// Connection info for display
-    host: String,
-    user: String,
 }
 
 impl SshBackend {
-    /// Create a new SSH backend
+    /// Create a new SSH backend with default pool size
     pub async fn new(
         user: Option<String>,
         host: String,
         path: String,
         port: Option<u16>,
     ) -> Result<Self> {
+        Self::with_pool_size(user, host, path, port, DEFAULT_MAX_CONNECTIONS).await
+    }
+
+    /// Create a new SSH backend with custom pool size
+    ///
+    /// The pool size should match the `-j/--jobs` parameter for optimal concurrency.
+    pub async fn with_pool_size(
+        user: Option<String>,
+        host: String,
+        path: String,
+        port: Option<u16>,
+        max_connections: usize,
+    ) -> Result<Self> {
         let port = port.unwrap_or(22);
         let user = user.unwrap_or_else(|| whoami::username());
 
-        tracing::info!(host = %host, user = %user, port = port, path = %path, "Connecting to SSH server via SFTP");
+        tracing::info!(
+            host = %host,
+            user = %user,
+            port = port,
+            path = %path,
+            max_connections = max_connections,
+            "Initializing SSH connection pool"
+        );
 
-        // Create SSH config
-        let config = Config::default();
-        let config = Arc::new(config);
+        let params = ConnectionParams {
+            user: user.clone(),
+            host: host.clone(),
+            port,
+        };
 
-        // Connect to SSH server
-        let mut handle = client::connect(config, (host.as_str(), port), SshHandler)
-            .await
-            .map_err(|e| Error::Ssh {
-                message: format!("Failed to connect to {}:{}: {}", host, port, e),
-            })?;
+        // Create the first connection to validate credentials
+        let initial_conn = create_sftp_connection(&params).await?;
+        tracing::info!("SSH authentication successful, SFTP session established");
 
-        // Try to authenticate
-        let authenticated = try_authenticate(&mut handle, &user).await?;
+        // Create the pool
+        let pool = Arc::new(SshConnectionPool::new(params, max_connections));
 
-        if !authenticated {
-            return Err(Error::Ssh {
-                message: format!("Authentication failed for {}@{}", user, host),
-            });
-        }
+        // Return the initial connection to the pool
+        pool.return_connection(initial_conn);
 
-        tracing::info!("SSH authentication successful");
-
-        // Open SFTP channel
-        let channel = handle.channel_open_session().await.map_err(|e| Error::Ssh {
-            message: format!("Failed to open SSH channel: {}", e),
-        })?;
-
-        // Request SFTP subsystem
-        channel.request_subsystem(true, "sftp").await.map_err(|e| Error::Ssh {
-            message: format!("Failed to request SFTP subsystem: {}", e),
-        })?;
-
-        // Create SFTP session
-        let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| Error::Ssh {
-            message: format!("Failed to initialize SFTP session: {}", e),
-        })?;
-
-        tracing::info!("SFTP session established");
-
-        let connection = SftpConnection { session: sftp, handle };
-
-        Ok(Self {
-            sftp: Arc::new(Mutex::new(connection)),
-            path,
-            host,
-            user,
-        })
+        Ok(Self { pool, path })
     }
 
     /// Get the remote base path
@@ -127,18 +287,149 @@ impl SshBackend {
     }
 
     /// List all files under the given prefix
+    ///
+    /// Uses a single remote `find` command to scan the entire directory tree,
+    /// avoiding multiple SFTP round-trips. Falls back to SFTP READDIR if the
+    /// remote command fails (e.g., on Windows SSH servers).
     pub async fn list(&self, prefix: &str) -> Result<Vec<FileEntry>> {
         let remote_path = self.resolve(prefix);
-        let conn = self.sftp.lock().await;
 
+        // Try batch scan first (single remote command)
+        match self.list_batch(&remote_path).await {
+            Ok(entries) => {
+                tracing::debug!(count = entries.len(), path = %remote_path, "Listed files via remote find");
+                return Ok(entries);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Remote find failed, falling back to SFTP readdir");
+            }
+        }
+
+        // Fallback to SFTP-based listing (multiple round-trips)
+        let conn = self.pool.acquire().await?;
         let mut entries = Vec::new();
-        self.list_recursive(&conn.session, &remote_path, &remote_path, &mut entries).await?;
+        self.list_recursive(conn.session(), &remote_path, &remote_path, &mut entries).await?;
 
-        tracing::debug!(count = entries.len(), path = %remote_path, "Listed SFTP files");
+        tracing::debug!(count = entries.len(), path = %remote_path, "Listed files via SFTP readdir");
         Ok(entries)
     }
 
-    /// Recursively list directory contents
+    /// Batch list using a single remote `find` command
+    ///
+    /// Executes `find` on the remote server and parses the output.
+    /// This is much faster than SFTP READDIR for large directory trees
+    /// as it requires only one network round-trip.
+    async fn list_batch(&self, remote_path: &str) -> Result<Vec<FileEntry>> {
+        // Use find with -printf to get all file info in one command
+        // Format: type\tsize\tmtime\tmode\tpath
+        // %y = file type (f=file, d=directory, l=symlink)
+        // %s = size in bytes
+        // %T@ = modification time as Unix timestamp
+        // %m = permissions in octal
+        // %P = path relative to starting point
+        let cmd = format!(
+            "find {} -printf '%y\\t%s\\t%T@\\t%m\\t%P\\n' 2>/dev/null",
+            shell_escape(remote_path)
+        );
+
+        let output = self.exec_command(&cmd).await?;
+
+        let mut entries = Vec::new();
+
+        for line in output.lines() {
+            if line.is_empty() {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.splitn(5, '\t').collect();
+            if parts.len() < 5 {
+                continue;
+            }
+
+            let file_type = parts[0];
+            let size: u64 = parts[1].parse().unwrap_or(0);
+            let mtime_secs: f64 = parts[2].parse().unwrap_or(0.0);
+            let mode: u32 = u32::from_str_radix(parts[3], 8).unwrap_or(0);
+            let path = parts[4];
+
+            // Skip empty paths (the root directory itself)
+            if path.is_empty() {
+                continue;
+            }
+
+            let is_dir = file_type == "d";
+            let mtime = if mtime_secs > 0.0 {
+                Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(mtime_secs))
+            } else {
+                None
+            };
+
+            entries.push(FileEntry {
+                path: path.into(),
+                size,
+                mtime,
+                is_dir,
+                mode: Some(mode),
+                etag: None,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    /// Execute a command on the remote server and return stdout
+    async fn exec_command(&self, cmd: &str) -> Result<String> {
+        let conn = self.pool.acquire().await?;
+        let handle = conn.handle();
+
+        // Open a new channel for command execution
+        let mut channel = handle.channel_open_session().await.map_err(|e| Error::Ssh {
+            message: format!("Failed to open exec channel: {}", e),
+        })?;
+
+        // Execute the command
+        channel.exec(true, cmd).await.map_err(|e| Error::Ssh {
+            message: format!("Failed to execute command: {}", e),
+        })?;
+
+        // Read all output using channel.wait()
+        let mut output = Vec::new();
+
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    output.extend_from_slice(&data);
+                }
+                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                    // stderr - log but don't include in output
+                    tracing::trace!("Remote stderr: {}", String::from_utf8_lossy(&data));
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    if exit_status != 0 {
+                        tracing::debug!(exit_status, "Remote command exited with non-zero status");
+                    }
+                }
+                Some(ChannelMsg::Eof) => {
+                    // No more data
+                    break;
+                }
+                Some(ChannelMsg::Close) => {
+                    break;
+                }
+                None => {
+                    // Channel closed
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        String::from_utf8(output).map_err(|e| Error::Ssh {
+            message: format!("Invalid UTF-8 in command output: {}", e),
+        })
+    }
+
+    /// Recursively list directory contents via SFTP (fallback method)
     async fn list_recursive(
         &self,
         sftp: &SftpSession,
@@ -198,9 +489,9 @@ impl SshBackend {
     /// Get file metadata
     pub async fn head(&self, path: &str) -> Result<Option<FileEntry>> {
         let remote_path = self.resolve(path);
-        let conn = self.sftp.lock().await;
+        let conn = self.pool.acquire().await?;
 
-        match conn.session.metadata(&remote_path).await {
+        match conn.session().metadata(&remote_path).await {
             Ok(attrs) => {
                 let is_dir = attrs.is_dir();
                 let size = attrs.size.unwrap_or(0);
@@ -236,9 +527,9 @@ impl SshBackend {
     /// WARNING: For large files, use `get_stream()` instead.
     pub async fn get(&self, path: &str) -> Result<Bytes> {
         let remote_path = self.resolve(path);
-        let conn = self.sftp.lock().await;
+        let conn = self.pool.acquire().await?;
 
-        let data = conn.session.read(&remote_path).await.map_err(|e| Error::Ssh {
+        let data = conn.session().read(&remote_path).await.map_err(|e| Error::Ssh {
             message: format!("Failed to read file {}: {}", remote_path, e),
         })?;
 
@@ -248,42 +539,45 @@ impl SshBackend {
     /// Read a file as a stream of chunks (memory-efficient for large files)
     ///
     /// Reads the file in chunks using SFTP seek/read operations to avoid
-    /// loading the entire file into memory at once.
+    /// loading the entire file into memory at once. The connection is held
+    /// from the pool for the duration of the stream.
     pub async fn get_stream(&self, path: &str) -> Result<ByteStream> {
         use futures::stream;
 
         const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB chunks
 
         let remote_path = self.resolve(path);
-        let conn = self.sftp.lock().await;
+        let conn = self.pool.acquire().await?;
 
         // Get file size first
-        let attrs = conn.session.metadata(&remote_path).await.map_err(|e| Error::Ssh {
+        let attrs = conn.session().metadata(&remote_path).await.map_err(|e| Error::Ssh {
             message: format!("Failed to stat file {}: {}", remote_path, e),
         })?;
         let file_size = attrs.size.unwrap_or(0) as usize;
 
-        // For small files, just read the whole thing
+        // For small files, just read the whole thing and release connection
         if file_size < CHUNK_SIZE {
-            let data = conn.session.read(&remote_path).await.map_err(|e| Error::Ssh {
+            let data = conn.session().read(&remote_path).await.map_err(|e| Error::Ssh {
                 message: format!("Failed to read file {}: {}", remote_path, e),
             })?;
+            drop(conn); // Return connection to pool
             return Ok(Box::pin(stream::once(async { Ok(Bytes::from(data)) })));
         }
 
         // For large files, open the file and stream chunks on-demand
-        let file = conn.session.open(&remote_path).await.map_err(|e| Error::Ssh {
+        let file = conn.session().open(&remote_path).await.map_err(|e| Error::Ssh {
             message: format!("Failed to open file {}: {}", remote_path, e),
         })?;
 
         // Wrap file in Arc<Mutex> for shared ownership with stream
-        let file = Arc::new(tokio::sync::Mutex::new(file));
+        let file = Arc::new(Mutex::new(file));
         let remote_path_clone = remote_path.clone();
 
-        // Use unfold to yield chunks on-demand
+        // Include the pooled connection in the stream state so it's held for the duration
+        // When the stream is dropped, the connection returns to the pool
         let stream = stream::unfold(
-            (file, 0usize, file_size, remote_path_clone),
-            move |(file, offset, total_size, path)| async move {
+            (file, 0usize, file_size, remote_path_clone, Some(conn)),
+            move |(file, offset, total_size, path, conn)| async move {
                 if offset >= total_size {
                     return None;
                 }
@@ -300,7 +594,7 @@ impl SshBackend {
                         Err(Error::Ssh {
                             message: format!("Failed to seek in file {}: {}", path, e),
                         }),
-                        (file.clone(), total_size, total_size, path), // Force end
+                        (file.clone(), total_size, total_size, path, conn), // Force end
                     ));
                 }
 
@@ -308,7 +602,7 @@ impl SshBackend {
                 match file_guard.read_exact(&mut buf[..to_read]).await {
                     Ok(_) => {
                         drop(file_guard);
-                        Some((Ok(buf.freeze()), (file, offset + to_read, total_size, path)))
+                        Some((Ok(buf.freeze()), (file, offset + to_read, total_size, path, conn)))
                     }
                     Err(_) => None, // EOF or error
                 }
@@ -324,10 +618,10 @@ impl SshBackend {
     /// loading the entire file into memory. Uses buffer pooling to reduce allocations.
     pub async fn get_range(&self, path: &str, start: u64, end: u64) -> Result<Bytes> {
         let remote_path = self.resolve(path);
-        let conn = self.sftp.lock().await;
+        let conn = self.pool.acquire().await?;
 
         // Open file for reading
-        let mut file = conn.session.open(&remote_path).await.map_err(|e| Error::Ssh {
+        let mut file = conn.session().open(&remote_path).await.map_err(|e| Error::Ssh {
             message: format!("Failed to open file {}: {}", remote_path, e),
         })?;
 
@@ -372,9 +666,9 @@ impl SshBackend {
         // Ensure parent directory exists
         self.ensure_parent_dir(&remote_path).await?;
 
-        let conn = self.sftp.lock().await;
+        let conn = self.pool.acquire().await?;
 
-        conn.session.write(&remote_path, &data).await.map_err(|e| Error::Ssh {
+        conn.session().write(&remote_path, &data).await.map_err(|e| Error::Ssh {
             message: format!("Failed to write file {}: {}", remote_path, e),
         })?;
 
@@ -392,10 +686,10 @@ impl SshBackend {
         // Ensure parent directory exists
         self.ensure_parent_dir(&remote_path).await?;
 
-        let conn = self.sftp.lock().await;
+        let conn = self.pool.acquire().await?;
 
         // Create/truncate the file and get a write handle
-        let mut file = conn.session.create(&remote_path).await.map_err(|e| Error::Ssh {
+        let mut file = conn.session().create(&remote_path).await.map_err(|e| Error::Ssh {
             message: format!("Failed to create file {}: {}", remote_path, e),
         })?;
 
@@ -422,22 +716,22 @@ impl SshBackend {
     /// Delete a file or directory
     pub async fn delete(&self, path: &str) -> Result<()> {
         let remote_path = self.resolve(path);
-        let conn = self.sftp.lock().await;
+        let conn = self.pool.acquire().await?;
 
         // Check if it's a directory
-        match conn.session.metadata(&remote_path).await {
+        match conn.session().metadata(&remote_path).await {
             Ok(attrs) if attrs.is_dir() => {
                 // Recursively delete directory contents first
-                self.delete_dir_contents(&conn.session, &remote_path).await?;
+                self.delete_dir_contents(conn.session(), &remote_path).await?;
 
                 // Remove the directory itself
-                conn.session.remove_dir(&remote_path).await.map_err(|e| Error::Ssh {
+                conn.session().remove_dir(&remote_path).await.map_err(|e| Error::Ssh {
                     message: format!("Failed to remove directory {}: {}", remote_path, e),
                 })?;
             }
             Ok(_) => {
                 // It's a file
-                conn.session.remove_file(&remote_path).await.map_err(|e| Error::Ssh {
+                conn.session().remove_file(&remote_path).await.map_err(|e| Error::Ssh {
                     message: format!("Failed to delete file {}: {}", remote_path, e),
                 })?;
             }
@@ -510,7 +804,7 @@ impl SshBackend {
 
     /// Create directory and all parents
     async fn mkdir_recursive(&self, path: &str) -> Result<()> {
-        let conn = self.sftp.lock().await;
+        let conn = self.pool.acquire().await?;
 
         // Split path into components and create each level
         let mut current = String::new();
@@ -522,7 +816,7 @@ impl SshBackend {
             };
 
             // Check if directory exists
-            match conn.session.metadata(&current).await {
+            match conn.session().metadata(&current).await {
                 Ok(attrs) if attrs.is_dir() => continue,
                 Ok(_) => {
                     return Err(Error::Ssh {
@@ -531,7 +825,7 @@ impl SshBackend {
                 }
                 Err(_) => {
                     // Directory doesn't exist, create it
-                    conn.session.create_dir(&current).await.map_err(|e| Error::Ssh {
+                    conn.session().create_dir(&current).await.map_err(|e| Error::Ssh {
                         message: format!("Failed to create directory {}: {}", current, e),
                     })?;
                 }
