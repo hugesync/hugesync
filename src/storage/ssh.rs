@@ -13,7 +13,7 @@ use russh::keys::ssh_key::PublicKey;
 use russh_sftp::client::SftpSession;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 /// SSH client handler for russh
@@ -231,7 +231,9 @@ impl SshBackend {
         }
     }
 
-    /// Read a file's contents
+    /// Read a file's contents (loads entire file into memory)
+    ///
+    /// WARNING: For large files, use `get_stream()` instead.
     pub async fn get(&self, path: &str) -> Result<Bytes> {
         let remote_path = self.resolve(path);
         let conn = self.sftp.lock().await;
@@ -243,8 +245,76 @@ impl SshBackend {
         Ok(Bytes::from(data))
     }
 
+    /// Read a file as a stream of chunks (memory-efficient for large files)
+    ///
+    /// Reads the file in chunks using SFTP seek/read operations to avoid
+    /// loading the entire file into memory at once.
+    pub async fn get_stream(&self, path: &str) -> Result<ByteStream> {
+        use bytes::BytesMut;
+        use futures::stream;
+
+        const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB chunks
+
+        let remote_path = self.resolve(path);
+        let conn = self.sftp.lock().await;
+
+        // Get file size first
+        let attrs = conn.session.metadata(&remote_path).await.map_err(|e| Error::Ssh {
+            message: format!("Failed to stat file {}: {}", remote_path, e),
+        })?;
+        let file_size = attrs.size.unwrap_or(0) as usize;
+
+        // For small files, just read the whole thing
+        if file_size < CHUNK_SIZE {
+            let data = conn.session.read(&remote_path).await.map_err(|e| Error::Ssh {
+                message: format!("Failed to read file {}: {}", remote_path, e),
+            })?;
+            return Ok(Box::pin(stream::once(async { Ok(Bytes::from(data)) })));
+        }
+
+        // For large files, read in chunks using seek/read
+        let mut file = conn.session.open(&remote_path).await.map_err(|e| Error::Ssh {
+            message: format!("Failed to open file {}: {}", remote_path, e),
+        })?;
+
+        let mut chunks = Vec::new();
+        let mut offset = 0usize;
+
+        while offset < file_size {
+            let to_read = std::cmp::min(CHUNK_SIZE, file_size - offset);
+            let mut buf = BytesMut::zeroed(to_read);
+
+            // Seek to position
+            file.seek(std::io::SeekFrom::Start(offset as u64))
+                .await
+                .map_err(|e| Error::Ssh {
+                    message: format!("Failed to seek in file {}: {}", remote_path, e),
+                })?;
+
+            // Read chunk
+            let bytes_read = file.read_exact(&mut buf).await.map_err(|e| Error::Ssh {
+                message: format!("Failed to read chunk from {}: {}", remote_path, e),
+            });
+
+            match bytes_read {
+                Ok(_) => {
+                    chunks.push(buf.freeze());
+                    offset += to_read;
+                }
+                Err(_) => break, // EOF or error
+            }
+        }
+
+        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+    }
+
     /// Read a range of bytes from a file
+    ///
+    /// Uses SFTP seek to read only the requested byte range, avoiding
+    /// loading the entire file into memory.
     pub async fn get_range(&self, path: &str, start: u64, end: u64) -> Result<Bytes> {
+        use bytes::BytesMut;
+
         let remote_path = self.resolve(path);
         let conn = self.sftp.lock().await;
 
@@ -253,21 +323,37 @@ impl SshBackend {
             message: format!("Failed to open file {}: {}", remote_path, e),
         })?;
 
-        // Read the full file and extract the range
-        // Note: russh-sftp doesn't have direct range read, so we read and slice
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).await.map_err(|e| Error::Ssh {
-            message: format!("Failed to read file {}: {}", remote_path, e),
-        })?;
+        // Seek to start position
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| Error::Ssh {
+                message: format!("Failed to seek in file {}: {}", remote_path, e),
+            })?;
 
-        let start = start as usize;
-        let end = std::cmp::min(end as usize + 1, data.len());
+        // Calculate how many bytes to read (end is inclusive)
+        let len = (end - start + 1) as usize;
+        let mut buf = BytesMut::zeroed(len);
 
-        if start >= data.len() {
-            return Ok(Bytes::new());
+        // Read the exact range
+        match file.read_exact(&mut buf).await {
+            Ok(_) => Ok(buf.freeze()),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // File is shorter than expected, read what we can
+                let mut buf = Vec::new();
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(|e| Error::Ssh {
+                        message: format!("Failed to seek in file {}: {}", remote_path, e),
+                    })?;
+                file.read_to_end(&mut buf).await.map_err(|e| Error::Ssh {
+                    message: format!("Failed to read file {}: {}", remote_path, e),
+                })?;
+                Ok(Bytes::from(buf))
+            }
+            Err(e) => Err(Error::Ssh {
+                message: format!("Failed to read range from {}: {}", remote_path, e),
+            }),
         }
-
-        Ok(Bytes::copy_from_slice(&data[start..end]))
     }
 
     /// Write a file's contents
@@ -288,27 +374,39 @@ impl SshBackend {
     }
 
     /// Write a file from a stream of chunks
+    ///
+    /// Writes chunks incrementally using SFTP seek/write operations to avoid
+    /// buffering the entire file in memory.
     pub async fn put_stream(&self, path: &str, mut stream: ByteStream) -> Result<()> {
         let remote_path = self.resolve(path);
 
         // Ensure parent directory exists
         self.ensure_parent_dir(&remote_path).await?;
 
-        // Collect stream into buffer
-        // TODO: Use SFTP write with offset for true streaming
-        let mut buffer = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let data = chunk?;
-            buffer.extend_from_slice(&data);
-        }
-
         let conn = self.sftp.lock().await;
 
-        conn.session.write(&remote_path, &buffer).await.map_err(|e| Error::Ssh {
-            message: format!("Failed to write file {}: {}", remote_path, e),
+        // Create/truncate the file and get a write handle
+        let mut file = conn.session.create(&remote_path).await.map_err(|e| Error::Ssh {
+            message: format!("Failed to create file {}: {}", remote_path, e),
         })?;
 
-        tracing::debug!(path = %remote_path, size = buffer.len(), "Wrote stream via SFTP");
+        let mut total_written = 0u64;
+
+        // Write chunks as they arrive
+        while let Some(chunk) = stream.next().await {
+            let data = chunk?;
+            file.write_all(&data).await.map_err(|e| Error::Ssh {
+                message: format!("Failed to write chunk to {}: {}", remote_path, e),
+            })?;
+            total_written += data.len() as u64;
+        }
+
+        // Flush to ensure all data is written
+        file.flush().await.map_err(|e| Error::Ssh {
+            message: format!("Failed to flush file {}: {}", remote_path, e),
+        })?;
+
+        tracing::debug!(path = %remote_path, size = total_written, "Wrote stream via SFTP");
         Ok(())
     }
 

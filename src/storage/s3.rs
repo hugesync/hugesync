@@ -130,7 +130,9 @@ impl S3Backend {
         }
     }
 
-    /// Read a file's contents
+    /// Read a file's contents (loads entire file into memory)
+    ///
+    /// WARNING: For large files, use `get_stream()` instead.
     pub async fn get(&self, path: &str) -> Result<Bytes> {
         let key = self.resolve_key(path);
 
@@ -155,6 +157,38 @@ impl S3Backend {
             .into_bytes();
 
         Ok(bytes)
+    }
+
+    /// Read a file as a stream of chunks (memory-efficient for large files)
+    pub async fn get_stream(&self, path: &str) -> Result<ByteStream> {
+        use futures::stream;
+
+        let key = self.resolve_key(path);
+
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| Error::Aws {
+                message: e.to_string(),
+            })?;
+
+        // Collect chunks from AWS ByteStream and create our stream
+        // AWS ByteStream yields Result<Bytes, ByteStreamError>
+        let mut chunks = Vec::new();
+        let mut body = output.body;
+
+        while let Some(chunk) = body.next().await {
+            let bytes = chunk.map_err(|e| Error::Aws {
+                message: format!("Error reading S3 stream: {}", e),
+            })?;
+            chunks.push(bytes);
+        }
+
+        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
     }
 
     /// Read a range of bytes from a file

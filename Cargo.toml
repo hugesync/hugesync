@@ -28,6 +28,7 @@ bytes = "1"
 jwalk = "0.8"
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 memmap2 = "0.9"
+fs2 = "0.4"  # Cross-platform file locking
 ignore = "0.4"
 
 # Cloud & Network - AWS

@@ -141,7 +141,9 @@ impl AzureBackend {
         }
     }
 
-    /// Get object content
+    /// Get object content (loads entire file into memory)
+    ///
+    /// WARNING: For large files, use `get_stream()` instead.
     pub async fn get(&self, path: &str) -> Result<Bytes> {
         let key = self.resolve_key(path);
         let blob_client = self.client.blob_client(&key);
@@ -151,6 +153,29 @@ impl AzureBackend {
         })?;
 
         Ok(Bytes::from(data))
+    }
+
+    /// Read a file as a stream of chunks (memory-efficient for large files)
+    pub async fn get_stream(&self, path: &str) -> Result<ByteStream> {
+        use futures::stream::TryStreamExt;
+
+        let key = self.resolve_key(path);
+        let blob_client = self.client.blob_client(&key);
+
+        let response = blob_client
+            .get()
+            .into_stream()
+            .next()
+            .await
+            .ok_or(Error::Azure { message: "Empty stream".into() })?
+            .map_err(|e| Error::Azure { message: format!("Failed to get blob: {}", e) })?;
+
+        // Convert Azure data stream to our ByteStream
+        let stream = response.data.map_err(|e| Error::Azure {
+            message: format!("Failed to read blob stream: {}", e),
+        });
+
+        Ok(Box::pin(stream))
     }
 
     /// Get range of object content

@@ -9,6 +9,7 @@ use crate::delta::coalesce::{coalesce_operations, prepare_for_s3_upload, PartCon
 use crate::delta::compute_delta_rolling;
 use crate::delta::Delta;
 use crate::error::{Error, Result};
+use crate::mmap::LockedMmap;
 use crate::signature::{read_signature_from_bytes, write_signature_to_bytes};
 use crate::storage::StorageBackend;
 use bytes::Bytes;
@@ -62,14 +63,11 @@ pub async fn delta_upload(
         }
     };
 
-    // Step 3: Read local file using memory mapping to avoid OOM
-    let file = std::fs::File::open(local_path)
-        .map_err(|e| Error::io("opening local file", e))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| Error::io("mmapping local file", e))?;
-    
+    // Step 3: Read local file using memory mapping with file locking to avoid OOM and SIGBUS
+    let mmap = LockedMmap::open(local_path)?;
+
     // Explicitly treat mmap as slice
-    let local_data = &mmap[..];
+    let local_data: &[u8] = &mmap;
     
     // Use the O(N) rolling checksum algorithm
     let delta = compute_delta_rolling(local_data, &remote_sig)?;
@@ -207,8 +205,9 @@ async fn delta_upload_multipart(
 }
 
 /// Perform a full file upload (no delta)
-/// 
+///
 /// Uses memory mapping and multipart uploads for large files to avoid OOM.
+/// For backends without multipart support (SSH), uses streaming upload.
 async fn full_upload(
     local_path: &Path,
     remote_path: &str,
@@ -219,16 +218,23 @@ async fn full_upload(
         .map_err(|e| Error::io("reading file metadata", e))?;
     let file_size = metadata.len();
 
-    // For small files, use simple put (still safe for memory)
-    if file_size < MULTIPART_THRESHOLD || !storage.supports_multipart() {
+    // For small files, use simple in-memory upload (safe for memory)
+    if file_size < MULTIPART_THRESHOLD {
         return full_upload_simple(local_path, remote_path, storage, config, file_size).await;
     }
 
-    // For large files, use memory-mapped multipart upload
-    full_upload_multipart(local_path, remote_path, storage, config, file_size).await
+    // For large files on backends with multipart support, use multipart
+    if storage.supports_multipart() {
+        return full_upload_multipart(local_path, remote_path, storage, config, file_size).await;
+    }
+
+    // For large files on backends without multipart (SSH), use streaming upload
+    full_upload_streaming(local_path, remote_path, storage, config, file_size).await
 }
 
 /// Simple upload for small files - reads into memory
+///
+/// Only used for files < MULTIPART_THRESHOLD (8MB), so safe for memory.
 async fn full_upload_simple(
     local_path: &Path,
     remote_path: &str,
@@ -264,6 +270,60 @@ async fn full_upload_simple(
     })
 }
 
+/// Streaming upload for large files on backends without multipart (e.g., SSH)
+///
+/// Uses memory-mapped streaming to avoid loading the entire file into RAM.
+async fn full_upload_streaming(
+    local_path: &Path,
+    remote_path: &str,
+    storage: &StorageBackend,
+    config: &Config,
+    file_size: u64,
+) -> Result<DeltaUploadResult> {
+    use futures::stream;
+
+    const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB chunks
+
+    tracing::info!(
+        size = file_size,
+        chunk_size = CHUNK_SIZE,
+        "Starting streaming upload for large file (no multipart support)"
+    );
+
+    // Memory-map the file with locking to avoid OOM and SIGBUS
+    let mmap = LockedMmap::open(local_path)?;
+
+    // Create a stream of chunks from the memory-mapped file
+    let total_size = mmap.len();
+    let chunks: Vec<Bytes> = (0..total_size)
+        .step_by(CHUNK_SIZE)
+        .map(|offset| {
+            let end = std::cmp::min(offset + CHUNK_SIZE, total_size);
+            Bytes::copy_from_slice(&mmap[offset..end])
+        })
+        .collect();
+
+    let byte_stream = Box::pin(stream::iter(chunks.into_iter().map(Ok)));
+
+    // Upload using streaming (works with SSH's put_stream)
+    storage.put_stream(remote_path, byte_stream, Some(file_size)).await?;
+
+    // Generate and upload signature if configured
+    if !config.no_sidecar && file_size >= config.delta_threshold {
+        let sig = crate::signature::generate::generate_signature_from_bytes(&*mmap, config.block_size);
+        let sig_data = write_signature_to_bytes(&sig)?;
+        let sig_path = format!("{}.hssig", remote_path);
+        storage.put(&sig_path, Bytes::from(sig_data)).await?;
+    }
+
+    Ok(DeltaUploadResult {
+        bytes_transferred: file_size,
+        bytes_reused: 0,
+        parts_uploaded: 1,
+        parts_copied: 0,
+    })
+}
+
 /// Multipart upload for large files - uses memory mapping to avoid OOM
 async fn full_upload_multipart(
     local_path: &Path,
@@ -272,11 +332,8 @@ async fn full_upload_multipart(
     config: &Config,
     file_size: u64,
 ) -> Result<DeltaUploadResult> {
-    // Memory-map the file to avoid loading it all into RAM
-    let file = std::fs::File::open(local_path)
-        .map_err(|e| Error::io("opening local file", e))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| Error::io("mmapping local file", e))?;
+    // Memory-map the file with locking to avoid OOM and SIGBUS
+    let mmap = LockedMmap::open(local_path)?;
 
     tracing::info!(
         size = file_size,
@@ -328,7 +385,7 @@ async fn full_upload_multipart(
 
     // Generate and upload signature if configured
     if !config.no_sidecar && file_size >= config.delta_threshold {
-        let sig = crate::signature::generate::generate_signature_from_bytes(&mmap[..], config.block_size);
+        let sig = crate::signature::generate::generate_signature_from_bytes(&*mmap, config.block_size);
         let sig_data = write_signature_to_bytes(&sig)?;
         let sig_path = format!("{}.hssig", remote_path);
         storage.put(&sig_path, Bytes::from(sig_data)).await?;

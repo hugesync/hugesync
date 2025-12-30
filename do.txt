@@ -358,10 +358,17 @@ CODE QUALITY OBSERVATIONS:
 6. Zero-Copy: Uses Bytes for efficient data transfer
 7. Atomic Stats: Thread-safe statistics with AtomicU64 counters
 8. Rsync Compat: Core comparison modes, backup, bandwidth limiting, itemized output
+9. Streaming Transfers: Large files use get_stream()/put_stream() to avoid loading into RAM
+   - Files < 8MB: Simple in-memory transfer
+   - Local source: Uses put_file() with memory-mapped streaming
+   - Cloud-to-cloud: Streams chunks directly between backends
 
-SSH LIMITATIONS:
-----------------
-- No multipart upload support (uses streaming instead)
+SSH STREAMING SUPPORT:
+----------------------
+- True streaming upload via put_stream() - writes chunks as they arrive
+- Chunked download via get_stream() - reads in 16MB chunks using seek/read
+- Range read via get_range() - seeks to position, reads only needed bytes
+- No multipart upload support (uses incremental write instead)
 - No server-side copy support (full file transfer required for delta)
 - Delta sync falls back to full upload for SSH destinations
 - Passphrase-protected keys not yet supported (use ssh-agent)

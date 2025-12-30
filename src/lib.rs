@@ -11,6 +11,7 @@ pub mod delta;
 pub mod error;
 pub mod format;
 pub mod itemize;
+pub mod mmap;
 pub mod progress;
 pub mod resume;
 pub mod retry;

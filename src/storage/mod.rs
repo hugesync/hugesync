@@ -105,7 +105,9 @@ impl StorageBackend {
         }
     }
 
-    /// Read a file's contents
+    /// Read a file's contents (loads entire file into memory)
+    ///
+    /// WARNING: For large files, use `get_stream()` instead to avoid OOM.
     pub async fn get(&self, path: &str) -> Result<Bytes> {
         match self {
             StorageBackend::Local(b) => b.get(path).await,
@@ -113,6 +115,20 @@ impl StorageBackend {
             StorageBackend::Gcs(b) => b.get(path).await,
             StorageBackend::Azure(b) => b.get(path).await,
             StorageBackend::Ssh(b) => b.get(path).await,
+        }
+    }
+
+    /// Read a file as a stream of chunks (memory-efficient for large files)
+    ///
+    /// This is the recommended method for transferring large files between
+    /// backends, as it never loads the entire file into memory.
+    pub async fn get_stream(&self, path: &str) -> Result<ByteStream> {
+        match self {
+            StorageBackend::Local(b) => b.get_stream(path),
+            StorageBackend::S3(b) => b.get_stream(path).await,
+            StorageBackend::Gcs(b) => b.get_stream(path).await,
+            StorageBackend::Azure(b) => b.get_stream(path).await,
+            StorageBackend::Ssh(b) => b.get_stream(path).await,
         }
     }
 
@@ -307,20 +323,20 @@ impl StorageBackend {
 }
 
 /// Convert a local file path to a stream of chunks using memory mapping
-/// 
+///
 /// This reads the file in 16MB chunks without loading the entire file into memory.
+/// Uses file locking to prevent SIGBUS if the file is modified during read.
 fn file_to_stream(path: &std::path::Path) -> Result<ByteStream> {
+    use crate::mmap::LockedMmap;
     use futures::stream;
-    
+
     const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB chunks
-    
-    let file = std::fs::File::open(path)
-        .map_err(|e| crate::error::Error::io("opening file for streaming", e))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| crate::error::Error::io("mmapping file for streaming", e))?;
-    
+
+    // Use LockedMmap for safe memory mapping with file locking
+    let mmap = LockedMmap::open(path)?;
+
     let total_size = mmap.len();
-    
+
     // Create an iterator that yields chunks
     let chunks: Vec<Bytes> = (0..total_size)
         .step_by(CHUNK_SIZE)
@@ -329,6 +345,6 @@ fn file_to_stream(path: &std::path::Path) -> Result<ByteStream> {
             Bytes::copy_from_slice(&mmap[offset..end])
         })
         .collect();
-    
+
     Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
 }

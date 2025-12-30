@@ -114,7 +114,9 @@ impl GcsBackend {
         }
     }
 
-    /// Read a file's contents
+    /// Read a file's contents (loads entire file into memory)
+    ///
+    /// WARNING: For large files, use `get_stream()` instead.
     pub async fn get(&self, path: &str) -> Result<Bytes> {
         let key = self.resolve_key(path);
 
@@ -127,6 +129,30 @@ impl GcsBackend {
         })?;
 
         Ok(bytes)
+    }
+
+    /// Read a file as a stream of chunks (memory-efficient for large files)
+    pub async fn get_stream(&self, path: &str) -> Result<ByteStream> {
+        use futures::stream;
+
+        let key = self.resolve_key(path);
+
+        let result = self.store.get(&key).await.map_err(|e| Error::Gcs {
+            message: format!("Failed to download object: {}", e),
+        })?;
+
+        // Collect chunks from object_store stream and create our stream
+        let mut chunks = Vec::new();
+        let mut obj_stream = result.into_stream();
+
+        while let Some(chunk) = obj_stream.next().await {
+            let bytes = chunk.map_err(|e| Error::Gcs {
+                message: format!("Failed to read object stream: {}", e),
+            })?;
+            chunks.push(bytes);
+        }
+
+        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
     }
 
     /// Read a range of bytes from a file

@@ -1,9 +1,11 @@
 //! Local filesystem storage backend
 
 use crate::error::{Error, Result};
+use crate::mmap::LockedMmap;
 use crate::storage::ByteStream;
 use crate::types::FileEntry;
 use bytes::Bytes;
+use futures::stream;
 use futures::StreamExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -121,13 +123,41 @@ impl LocalBackend {
         }
     }
 
-    /// Read a file's contents
+    /// Read a file's contents (loads entire file into memory)
+    ///
+    /// WARNING: For large files, use `get_stream()` instead.
     pub async fn get(&self, path: &str) -> Result<Bytes> {
         let full_path = self.resolve(path);
         let data = fs::read(&full_path)
             .await
             .map_err(|e| Error::io("reading file", e))?;
         Ok(Bytes::from(data))
+    }
+
+    /// Read a file as a stream of chunks (memory-efficient for large files)
+    ///
+    /// Uses memory-mapping with file locking to avoid loading the entire file into RAM
+    /// and prevent SIGBUS if the file is modified during read.
+    /// Yields chunks of 16MB at a time.
+    pub fn get_stream(&self, path: &str) -> Result<ByteStream> {
+        const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB chunks
+
+        let full_path = self.resolve(path);
+        // Use LockedMmap for safe memory mapping with file locking
+        let mmap = LockedMmap::open(&full_path)?;
+
+        let total_size = mmap.len();
+
+        // Create an iterator that yields chunks
+        let chunks: Vec<Bytes> = (0..total_size)
+            .step_by(CHUNK_SIZE)
+            .map(|offset| {
+                let end = std::cmp::min(offset + CHUNK_SIZE, total_size);
+                Bytes::copy_from_slice(&mmap[offset..end])
+            })
+            .collect();
+
+        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
     }
 
     /// Read a range of bytes from a file

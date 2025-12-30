@@ -2,7 +2,7 @@
 
 use super::{BlockChecksum, Signature};
 use crate::error::{Error, Result};
-use memmap2::Mmap;
+use crate::mmap::LockedMmap;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::Read;
@@ -41,9 +41,11 @@ pub fn generate_signature(path: &Path, block_size: usize) -> Result<Signature> {
 }
 
 /// Generate signature using memory mapping (for large files)
+///
+/// Uses file locking to prevent SIGBUS if file is modified during read.
 fn generate_signature_mmap(path: &Path, block_size: usize, file_size: u64) -> Result<Signature> {
-    let file = File::open(path).map_err(|e| Error::io("opening file", e))?;
-    let mmap = unsafe { Mmap::map(&file).map_err(|e| Error::io("memory mapping file", e))? };
+    // Use LockedMmap for safe memory mapping with file locking
+    let mmap = LockedMmap::open(path)?;
 
     let num_blocks = (file_size as usize + block_size - 1) / block_size;
 
@@ -65,7 +67,7 @@ fn generate_signature_mmap(path: &Path, block_size: usize, file_size: u64) -> Re
         .collect();
 
     // Compute file hash for etag (using BLAKE3 of entire file)
-    let file_hash = blake3::hash(&mmap);
+    let file_hash = blake3::hash(&*mmap);
     let etag = hex::encode(&file_hash.as_bytes()[..16]); // Use first 16 bytes for shorter etag
 
     let mut sig = Signature::new(block_size, file_size);
