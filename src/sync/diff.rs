@@ -12,7 +12,6 @@
 use crate::config::Config;
 use crate::sync::scan::{build_file_map, FileMap};
 use crate::types::{FileEntry, PlannedAction, SyncAction};
-use dashmap::DashSet;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,106 +145,48 @@ pub fn compute_diff_maps(
 
     // Process source files - check what needs to be uploaded/updated
     for entry in source_map.iter() {
-        let source_entry = entry.value();
-
-        // Skip files outside size limits
-        if !source_entry.is_dir && !config.file_within_size_limits(source_entry.size) {
-            tracing::debug!(
-                path = %source_entry.path.display(),
-                size = source_entry.size,
-                "Skipping file outside size limits"
-            );
-            continue;
-        }
-
-        let path_str = entry.key();
-
-        if source_entry.is_dir {
-            // Create directories at destination
-            if !dest_map.contains_key(path_str) {
-                actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Mkdir));
-            }
-            continue;
-        }
-
-        match dest_map.get(path_str) {
-            None => {
-                // File doesn't exist at destination
-                if config.existing {
-                    tracing::debug!(
-                        path = %source_entry.path.display(),
-                        "Skipping new file (--existing)"
-                    );
-                    continue;
-                }
-
-                // New file - upload
-                actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Upload));
-            }
-            Some(dest_ref) => {
-                let dest_entry = dest_ref.value();
-
-                // --ignore-existing: Skip files that exist on receiver
-                if config.ignore_existing {
-                    tracing::debug!(
-                        path = %source_entry.path.display(),
-                        "Skipping existing file (--ignore-existing)"
-                    );
-                    actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
-                    continue;
-                }
-
-                // --update: Skip files newer on receiver
-                if config.update && is_dest_newer(source_entry, dest_entry, config.modify_window) {
-                    tracing::debug!(
-                        path = %source_entry.path.display(),
-                        "Skipping file newer on receiver (--update)"
-                    );
-                    actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
-                    continue;
-                }
-
-                // Check if files match based on comparison mode
-                let matches = if config.checksum {
-                    files_match_checksum(source_entry, dest_entry)
-                } else if config.size_only {
-                    files_match_size_only(source_entry, dest_entry)
-                } else {
-                    files_match_mtime_size(source_entry, dest_entry, config.modify_window)
-                };
-
-                if matches {
-                    actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
-                } else {
-                    // File differs - use delta for large files if supported
-                    let action = if config.should_use_delta(source_entry.size) {
-                        SyncAction::Delta
-                    } else {
-                        SyncAction::Upload
-                    };
-                    actions.push(PlannedAction::new(source_entry.clone(), action));
-                }
-            }
+        if let Some(action) = process_source_entry(entry.key(), entry.value(), dest_map, config) {
+            actions.push(action);
         }
     }
 
     // Check for files to delete (if --delete is enabled)
     if config.delete {
-        // Build a DashSet of source paths for O(1) lookup
-        let source_paths: DashSet<String> = DashSet::with_capacity(source_map.len());
-        source_map.iter().for_each(|entry| {
-            source_paths.insert(entry.key().clone());
-        });
-
         for entry in dest_map.iter() {
-            let path_str = entry.key();
-            if !source_paths.contains(path_str) {
+            if !source_map.contains_key(entry.key()) {
                 actions.push(PlannedAction::new(entry.value().clone(), SyncAction::Delete));
             }
         }
     }
 
     actions
+}
+
+/// Threshold for switching to parallel diff (number of files)
+const PARALLEL_DIFF_THRESHOLD: usize = 10_000;
+
+/// Compute diff using the best strategy based on file count
+///
+/// Automatically selects parallel processing for large directories (10,000+ files)
+/// and sequential processing for smaller directories.
+pub fn compute_diff_auto(
+    source_map: &Arc<FileMap>,
+    dest_map: &Arc<FileMap>,
+    config: &Config,
+) -> Vec<PlannedAction> {
+    let total_files = source_map.len() + dest_map.len();
+
+    if total_files >= PARALLEL_DIFF_THRESHOLD {
+        tracing::debug!(
+            source_files = source_map.len(),
+            dest_files = dest_map.len(),
+            "Using parallel diff for {} total files",
+            total_files
+        );
+        compute_diff_maps_parallel(source_map, dest_map, config)
+    } else {
+        compute_diff_maps(source_map, dest_map, config)
+    }
 }
 
 /// Compute diff in parallel using rayon (for very large directories)
@@ -262,70 +203,19 @@ pub fn compute_diff_maps_parallel(
     // Collect source entries for parallel processing
     let source_entries: Vec<_> = source_map.iter().collect();
 
-    // Process in parallel
+    // Process source files in parallel
     let mut actions: Vec<PlannedAction> = source_entries
         .into_par_iter()
         .filter_map(|entry| {
-            let source_entry = entry.value();
-            let path_str = entry.key();
-
-            // Skip files outside size limits
-            if !source_entry.is_dir && !config.file_within_size_limits(source_entry.size) {
-                return None;
-            }
-
-            if source_entry.is_dir {
-                if !dest_map.contains_key(path_str) {
-                    return Some(PlannedAction::new(source_entry.clone(), SyncAction::Mkdir));
-                }
-                return None;
-            }
-
-            match dest_map.get(path_str) {
-                None => {
-                    if config.existing {
-                        return None;
-                    }
-                    Some(PlannedAction::new(source_entry.clone(), SyncAction::Upload))
-                }
-                Some(dest_ref) => {
-                    let dest_entry = dest_ref.value();
-
-                    if config.ignore_existing {
-                        return Some(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
-                    }
-
-                    if config.update && is_dest_newer(source_entry, dest_entry, config.modify_window) {
-                        return Some(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
-                    }
-
-                    let matches = if config.checksum {
-                        files_match_checksum(source_entry, dest_entry)
-                    } else if config.size_only {
-                        files_match_size_only(source_entry, dest_entry)
-                    } else {
-                        files_match_mtime_size(source_entry, dest_entry, config.modify_window)
-                    };
-
-                    if matches {
-                        Some(PlannedAction::new(source_entry.clone(), SyncAction::Skip))
-                    } else {
-                        let action = if config.should_use_delta(source_entry.size) {
-                            SyncAction::Delta
-                        } else {
-                            SyncAction::Upload
-                        };
-                        Some(PlannedAction::new(source_entry.clone(), action))
-                    }
-                }
-            }
+            process_source_entry(entry.key(), entry.value(), dest_map, config)
         })
         .collect();
 
-    // Handle deletions
+    // Handle deletions in parallel
     if config.delete {
-        let delete_actions: Vec<_> = dest_map
-            .iter()
+        let dest_entries: Vec<_> = dest_map.iter().collect();
+        let delete_actions: Vec<_> = dest_entries
+            .into_par_iter()
             .filter_map(|entry| {
                 if !source_map.contains_key(entry.key()) {
                     Some(PlannedAction::new(entry.value().clone(), SyncAction::Delete))
@@ -338,6 +228,68 @@ pub fn compute_diff_maps_parallel(
     }
 
     actions
+}
+
+/// Process a single source entry and determine the action needed
+///
+/// Extracted for reuse between sequential and parallel implementations.
+#[inline]
+fn process_source_entry(
+    path_str: &str,
+    source_entry: &FileEntry,
+    dest_map: &Arc<FileMap>,
+    config: &Config,
+) -> Option<PlannedAction> {
+    // Skip files outside size limits
+    if !source_entry.is_dir && !config.file_within_size_limits(source_entry.size) {
+        return None;
+    }
+
+    if source_entry.is_dir {
+        if !dest_map.contains_key(path_str) {
+            return Some(PlannedAction::new(source_entry.clone(), SyncAction::Mkdir));
+        }
+        return None;
+    }
+
+    match dest_map.get(path_str) {
+        None => {
+            if config.existing {
+                return None;
+            }
+            Some(PlannedAction::new(source_entry.clone(), SyncAction::Upload))
+        }
+        Some(dest_ref) => {
+            let dest_entry = dest_ref.value();
+
+            if config.ignore_existing {
+                return Some(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
+            }
+
+            if config.update && is_dest_newer(source_entry, dest_entry, config.modify_window) {
+                return Some(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
+            }
+
+            let matches = if config.checksum {
+                files_match_checksum(source_entry, dest_entry)
+            } else if config.size_only {
+                files_match_size_only(source_entry, dest_entry)
+            } else {
+                files_match_mtime_size(source_entry, dest_entry, config.modify_window)
+            };
+
+            if matches {
+                Some(PlannedAction::new(source_entry.clone(), SyncAction::Skip))
+            } else {
+                let action = if config.should_use_delta(source_entry.size) {
+                    SyncAction::Delta
+                } else {
+                    SyncAction::Upload
+                };
+                Some(PlannedAction::new(source_entry.clone(), action))
+            }
+        }
+    }
 }
 
 /// Check if destination file is newer than source (for --update mode)
@@ -410,12 +362,11 @@ fn files_match_mtime_size(source: &FileEntry, dest: &FileEntry, modify_window: i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::SystemTime;
 
     fn make_entry(path: &str, size: u64) -> FileEntry {
         FileEntry {
-            path: PathBuf::from(path),
+            path: path.into(),
             size,
             mtime: Some(SystemTime::now()),
             is_dir: false,
@@ -640,6 +591,37 @@ mod tests {
         let config = Config::default();
 
         let actions = compute_diff_maps_parallel(&source_map, &dest_map, &config);
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|a| a.action == SyncAction::Upload));
+    }
+
+    #[test]
+    fn test_dashmap_parallel_with_deletes() {
+        let source_map = make_file_map(vec![make_entry("keep.txt", 100)]);
+        let dest_map = make_file_map(vec![
+            make_entry("keep.txt", 100),
+            make_entry("delete_me.txt", 200),
+        ]);
+        let mut config = Config::default();
+        config.delete = true;
+
+        let actions = compute_diff_maps_parallel(&source_map, &dest_map, &config);
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().any(|a| a.action == SyncAction::Skip));
+        assert!(actions.iter().any(|a| a.action == SyncAction::Delete));
+    }
+
+    #[test]
+    fn test_compute_diff_auto() {
+        // Test with small file count (should use sequential)
+        let source_map = make_file_map(vec![
+            make_entry("file1.txt", 100),
+            make_entry("file2.txt", 200),
+        ]);
+        let dest_map = make_file_map(vec![]);
+        let config = Config::default();
+
+        let actions = compute_diff_auto(&source_map, &dest_map, &config);
         assert_eq!(actions.len(), 2);
         assert!(actions.iter().all(|a| a.action == SyncAction::Upload));
     }

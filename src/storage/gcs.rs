@@ -8,7 +8,6 @@ use futures::StreamExt;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Google Cloud Storage backend
@@ -82,7 +81,7 @@ impl GcsBackend {
             }
 
             entries.push(FileEntry {
-                path: PathBuf::from(&relative),
+                path: relative.as_str().into(),
                 size: meta.size as u64,
                 mtime: Some(meta.last_modified.into()),
                 is_dir: relative.ends_with('/'),
@@ -100,7 +99,7 @@ impl GcsBackend {
 
         match self.store.head(&key).await {
             Ok(meta) => Ok(Some(FileEntry {
-                path: PathBuf::from(path),
+                path: path.into(),
                 size: meta.size as u64,
                 mtime: Some(meta.last_modified.into()),
                 is_dir: false,

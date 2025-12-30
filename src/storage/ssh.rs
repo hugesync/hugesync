@@ -3,6 +3,7 @@
 //! This backend provides SFTP-based file transfers using the russh library,
 //! which is a pure Rust SSH implementation that works across all platforms.
 
+use crate::bufpool::global as bufpool;
 use crate::error::{Error, Result};
 use crate::storage::ByteStream;
 use crate::types::FileEntry;
@@ -11,7 +12,6 @@ use futures::StreamExt;
 use russh::client::{self, Config, Handle, Handler};
 use russh::keys::ssh_key::PublicKey;
 use russh_sftp::client::SftpSession;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -177,7 +177,7 @@ impl SshBackend {
             });
 
             entries.push(FileEntry {
-                path: PathBuf::from(&relative_path),
+                path: relative_path.as_str().into(),
                 size,
                 mtime,
                 is_dir,
@@ -209,7 +209,7 @@ impl SshBackend {
                 });
 
                 Ok(Some(FileEntry {
-                    path: PathBuf::from(path),
+                    path: path.into(),
                     size,
                     mtime,
                     is_dir,
@@ -250,7 +250,6 @@ impl SshBackend {
     /// Reads the file in chunks using SFTP seek/read operations to avoid
     /// loading the entire file into memory at once.
     pub async fn get_stream(&self, path: &str) -> Result<ByteStream> {
-        use bytes::BytesMut;
         use futures::stream;
 
         const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB chunks
@@ -290,7 +289,8 @@ impl SshBackend {
                 }
 
                 let to_read = std::cmp::min(CHUNK_SIZE, total_size - offset);
-                let mut buf = BytesMut::zeroed(to_read);
+                // Use buffer pool to reduce allocations
+                let mut buf = bufpool::acquire_chunk_sized(to_read);
 
                 let mut file_guard = file.lock().await;
 
@@ -305,7 +305,7 @@ impl SshBackend {
                 }
 
                 // Read chunk
-                match file_guard.read_exact(&mut buf).await {
+                match file_guard.read_exact(&mut buf[..to_read]).await {
                     Ok(_) => {
                         drop(file_guard);
                         Some((Ok(buf.freeze()), (file, offset + to_read, total_size, path)))
@@ -321,10 +321,8 @@ impl SshBackend {
     /// Read a range of bytes from a file
     ///
     /// Uses SFTP seek to read only the requested byte range, avoiding
-    /// loading the entire file into memory.
+    /// loading the entire file into memory. Uses buffer pooling to reduce allocations.
     pub async fn get_range(&self, path: &str, start: u64, end: u64) -> Result<Bytes> {
-        use bytes::BytesMut;
-
         let remote_path = self.resolve(path);
         let conn = self.sftp.lock().await;
 
@@ -342,10 +340,11 @@ impl SshBackend {
 
         // Calculate how many bytes to read (end is inclusive)
         let len = (end - start + 1) as usize;
-        let mut buf = BytesMut::zeroed(len);
+        // Use buffer pool to reduce allocations
+        let mut buf = bufpool::acquire_chunk_sized(len);
 
         // Read the exact range
-        match file.read_exact(&mut buf).await {
+        match file.read_exact(&mut buf[..len]).await {
             Ok(_) => Ok(buf.freeze()),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // File is shorter than expected, read what we can

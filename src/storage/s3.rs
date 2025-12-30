@@ -7,7 +7,6 @@ use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use futures::StreamExt;
-use std::path::PathBuf;
 
 /// AWS S3 storage backend
 #[derive(Clone)]
@@ -79,7 +78,7 @@ impl S3Backend {
                     };
 
                     entries.push(FileEntry {
-                        path: PathBuf::from(relative),
+                        path: relative.into(),
                         size: obj.size().unwrap_or(0) as u64,
                         mtime: obj.last_modified().and_then(|t| {
                             std::time::UNIX_EPOCH
@@ -103,7 +102,7 @@ impl S3Backend {
         match self.client.head_object().bucket(&self.bucket).key(&key).send().await {
             Ok(output) => {
                 let entry = FileEntry {
-                    path: PathBuf::from(path),
+                    path: path.into(),
                     size: output.content_length().unwrap_or(0) as u64,
                     mtime: output.last_modified().and_then(|t| {
                         std::time::UNIX_EPOCH

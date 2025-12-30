@@ -1,5 +1,6 @@
 //! Local filesystem storage backend
 
+use crate::bufpool::global as bufpool;
 use crate::error::{Error, Result};
 use crate::mmap::LockedMmap;
 use crate::storage::ByteStream;
@@ -75,7 +76,7 @@ impl LocalBackend {
                         };
 
                         let entry = FileEntry {
-                            path: relative,
+                            path: relative.into(),
                             size: metadata.len(),
                             mtime: metadata.modified().ok(),
                             is_dir: metadata.is_dir(),
@@ -109,7 +110,7 @@ impl LocalBackend {
         match fs::metadata(&full_path).await {
             Ok(metadata) => {
                 let entry = FileEntry {
-                    path: PathBuf::from(path),
+                    path: path.into(),
                     size: metadata.len(),
                     mtime: metadata.modified().ok(),
                     is_dir: metadata.is_dir(),
@@ -164,9 +165,8 @@ impl LocalBackend {
 
     /// Read a range of bytes from a file
     ///
-    /// Uses BytesMut for zero-copy conversion to Bytes
+    /// Uses pooled buffers to reduce allocation overhead
     pub async fn get_range(&self, path: &str, start: u64, end: u64) -> Result<Bytes> {
-        use bytes::BytesMut;
         use tokio::io::AsyncSeekExt;
 
         let full_path = self.resolve(path);
@@ -179,12 +179,13 @@ impl LocalBackend {
             .map_err(|e| Error::io("seeking file", e))?;
 
         let len = (end - start + 1) as usize;
-        // Use BytesMut for zero-copy freeze to Bytes
-        let mut buf = BytesMut::zeroed(len);
-        file.read_exact(&mut buf)
+        // Use buffer pool to reduce allocations
+        let mut buf = bufpool::acquire_chunk_sized(len);
+        file.read_exact(&mut buf[..len])
             .await
             .map_err(|e| Error::io("reading range", e))?;
 
+        // Freeze and return; buffer is consumed (not returned to pool)
         Ok(buf.freeze())
     }
 

@@ -24,6 +24,8 @@ num_cpus = "1"
 rayon = "1"
 bytes = "1"
 dashmap = "6"  # Concurrent HashMap for parallel scanning
+lasso = { version = "0.7", features = ["multi-threaded"] }  # String interning for path deduplication
+crossbeam-queue = "0.3"  # Lock-free buffer pooling
 
 # Filesystem & Walking
 jwalk = "0.8"

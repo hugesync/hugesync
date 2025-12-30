@@ -201,6 +201,7 @@ pub async fn execute_plan(
 
 /// Upload a single file from source to destination using streaming
 ///
+/// For local-to-local transfers, uses zero-copy kernel transfer (copy_file_range/sendfile).
 /// For local source files, uses memory-mapped streaming upload.
 /// For cloud sources, streams chunks directly to destination without
 /// loading the entire file into memory.
@@ -211,6 +212,31 @@ async fn upload_file(
     size: u64,
     progress: &ProgressTracker,
 ) -> Result<u64> {
+    // Zero-copy local-to-local transfer using kernel copy_file_range/sendfile
+    if let (StorageBackend::Local(src_local), StorageBackend::Local(dst_local)) = (source, dest) {
+        let src_path = src_local.root().join(path);
+        let dst_path = dst_local.root().join(path);
+
+        // Ensure parent directory exists
+        if let Some(parent) = dst_path.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| crate::error::Error::io("creating parent directory", e))?;
+        }
+
+        progress.update_file_progress(size / 3);
+
+        // Use std::fs::copy in blocking task - leverages kernel zero-copy
+        let bytes_copied = tokio::task::spawn_blocking(move || {
+            std::fs::copy(&src_path, &dst_path)
+        })
+        .await
+        .map_err(|e| crate::error::Error::io("spawn blocking", std::io::Error::other(e)))?
+        .map_err(|e| crate::error::Error::io("zero-copy file transfer", e))?;
+
+        progress.update_file_progress(bytes_copied);
+        return Ok(bytes_copied);
+    }
+
     // For small files, use simple in-memory transfer
     if size < STREAMING_THRESHOLD {
         let data = source.get(path).await?;
@@ -221,7 +247,7 @@ async fn upload_file(
         return Ok(actual_size);
     }
 
-    // For local source, use optimized put_file which uses mmap
+    // For local source to cloud, use optimized put_file which uses mmap
     if let StorageBackend::Local(local) = source {
         let local_path = local.root().join(path);
         progress.update_file_progress(size / 3);
@@ -241,6 +267,7 @@ async fn upload_file(
 
 /// Download a single file from source to destination using streaming
 ///
+/// For local-to-local transfers, uses zero-copy kernel transfer (copy_file_range/sendfile).
 /// Streams chunks from source to destination without loading
 /// the entire file into memory.
 async fn download_file(
@@ -250,6 +277,31 @@ async fn download_file(
     size: u64,
     progress: &ProgressTracker,
 ) -> Result<u64> {
+    // Zero-copy local-to-local transfer using kernel copy_file_range/sendfile
+    if let (StorageBackend::Local(src_local), StorageBackend::Local(dst_local)) = (source, dest) {
+        let src_path = src_local.root().join(path);
+        let dst_path = dst_local.root().join(path);
+
+        // Ensure parent directory exists
+        if let Some(parent) = dst_path.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| crate::error::Error::io("creating parent directory", e))?;
+        }
+
+        progress.update_file_progress(size / 3);
+
+        // Use std::fs::copy in blocking task - leverages kernel zero-copy
+        let bytes_copied = tokio::task::spawn_blocking(move || {
+            std::fs::copy(&src_path, &dst_path)
+        })
+        .await
+        .map_err(|e| crate::error::Error::io("spawn blocking", std::io::Error::other(e)))?
+        .map_err(|e| crate::error::Error::io("zero-copy file transfer", e))?;
+
+        progress.update_file_progress(bytes_copied);
+        return Ok(bytes_copied);
+    }
+
     // For small files, use simple in-memory transfer
     if size < STREAMING_THRESHOLD {
         let data = source.get(path).await?;
@@ -260,7 +312,7 @@ async fn download_file(
         return Ok(actual_size);
     }
 
-    // For local destination from cloud, stream directly
+    // For cloud to local destination, stream directly
     let stream = source.get_stream(path).await?;
     progress.update_file_progress(size / 3);
     dest.put_stream(path, stream, Some(size)).await?;

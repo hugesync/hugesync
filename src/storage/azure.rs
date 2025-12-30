@@ -9,7 +9,6 @@ use azure_storage_blobs::prelude::*;
 use bytes::Bytes;
 use futures::StreamExt;
 use std::env;
-use std::path::PathBuf;
 use std::sync::Arc;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
@@ -101,7 +100,7 @@ impl AzureBackend {
                 }
 
                 entries.push(FileEntry {
-                    path: PathBuf::from(relative),
+                    path: relative.into(),
                     size: blob.properties.content_length,
                     mtime: Some(blob.properties.last_modified.into()),
                     is_dir: false, // Azure is flat namespace
@@ -121,7 +120,7 @@ impl AzureBackend {
 
         match blob_client.get_properties().await {
             Ok(props) => Ok(Some(FileEntry {
-                path: PathBuf::from(path),
+                path: path.into(),
                 size: props.blob.properties.content_length,
                 mtime: Some(props.blob.properties.last_modified.into()),
                 is_dir: false,

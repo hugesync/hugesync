@@ -79,11 +79,10 @@ pub fn build_file_map(entries: &[FileEntry]) -> std::collections::HashMap<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn make_entry(path: &str, size: u64) -> FileEntry {
         FileEntry {
-            path: PathBuf::from(path),
+            path: path.into(),
             size,
             mtime: None,
             is_dir: false,

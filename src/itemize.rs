@@ -322,11 +322,10 @@ impl ItemizedLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn make_entry(path: &str, size: u64, is_dir: bool) -> FileEntry {
         FileEntry {
-            path: PathBuf::from(path),
+            path: path.into(),
             size,
             mtime: None,
             is_dir,

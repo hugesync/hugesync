@@ -4,12 +4,14 @@
 //! and cloud object storage (S3, GCS, Azure).
 
 pub mod backup;
+pub mod bufpool;
 pub mod bwlimit;
 pub mod cli;
 pub mod config;
 pub mod delta;
 pub mod error;
 pub mod format;
+pub mod intern;
 pub mod itemize;
 pub mod mmap;
 pub mod progress;
