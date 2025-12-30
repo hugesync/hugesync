@@ -2,6 +2,7 @@
 
 use super::Delta;
 use crate::signature::{quick_hash, Signature};
+use crate::simd::rolling_checksum_simd;
 use std::io::Read;
 
 /// Compute a delta between a local file and a remote signature
@@ -76,21 +77,11 @@ pub fn compute_delta<R: Read>(mut local_reader: R, remote_sig: &Signature) -> cr
     Ok(delta)
 }
 
-/// Proper rolling checksum (Adler-32 style)
-/// This computes the checksum for a block - the "rolling" update happens in the main loop
-/// by using the fast_rsync crate for production, but here we provide a compatible implementation
+/// Proper rolling checksum (Adler-32 style) - uses SIMD when available
+/// This computes the checksum for a block - the "rolling" update happens via RollingChecksum
+#[inline]
 fn rolling_checksum(data: &[u8]) -> u32 {
-    // Use fast_rsync's signature generation for compatibility
-    // This is the same algorithm used when generating signatures
-    let mut a: u32 = 0;
-    let mut b: u32 = 0;
-
-    for &byte in data {
-        a = a.wrapping_add(byte as u32);
-        b = b.wrapping_add(a);
-    }
-
-    (b << 16) | (a & 0xffff)
+    rolling_checksum_simd(data)
 }
 
 /// Rolling checksum state for O(1) updates

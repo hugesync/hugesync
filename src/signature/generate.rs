@@ -3,60 +3,30 @@
 use super::{BlockChecksum, Signature};
 use crate::error::{Error, Result};
 use crate::mmap::LockedMmap;
+use crate::simd::rolling_checksum_simd;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-/// Rolling checksum implementation (Adler32-like)
+/// Rolling checksum implementation - uses SIMD when available
+#[inline]
 fn rolling_checksum(data: &[u8]) -> u32 {
-    let mut a: u32 = 0;
-    let mut b: u32 = 0;
-
-    for &byte in data {
-        a = a.wrapping_add(byte as u32);
-        b = b.wrapping_add(a);
-    }
-
-    (b << 16) | (a & 0xffff)
+    rolling_checksum_simd(data)
 }
 
-/// Compute a quick secondary hash for filtering false positives
-/// Uses xxHash-style mixing for better distribution than Adler-32
-/// This samples data at intervals to stay fast even for large blocks (5MB)
+/// Compute a quick hash for filtering false positives before expensive full BLAKE3.
+///
+/// Uses xxHash3 on the FULL block - no sampling, no missed changes.
+/// xxHash3 is ~30 GB/s (vs BLAKE3 ~3 GB/s), so for 5MB:
+/// - xxHash3: ~0.17ms
+/// - BLAKE3:  ~1.7ms
+///
+/// The 64-bit output gives collision rate of 1/2^64 ≈ 0, effectively eliminating
+/// false positives before the expensive BLAKE3 verification.
 #[inline]
 pub fn quick_hash(data: &[u8]) -> u64 {
-    // Sample every 4KB to make this fast even for 5MB blocks
-    // This catches most false positives from repetitive data
-    const SAMPLE_INTERVAL: usize = 4096;
-    const PRIME1: u64 = 0x9E3779B185EBCA87;
-    const PRIME2: u64 = 0xC2B2AE3D27D4EB4F;
-
-    let mut hash: u64 = data.len() as u64;
-
-    // Sample bytes at regular intervals
-    for i in (0..data.len()).step_by(SAMPLE_INTERVAL) {
-        let end = std::cmp::min(i + 8, data.len());
-        let mut sample: u64 = 0;
-        for (j, &byte) in data[i..end].iter().enumerate() {
-            sample |= (byte as u64) << (j * 8);
-        }
-        hash = hash.wrapping_mul(PRIME1).wrapping_add(sample);
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(PRIME2);
-    }
-
-    // Also include first and last 64 bytes for boundary sensitivity
-    if data.len() >= 64 {
-        for &byte in &data[..64] {
-            hash = hash.wrapping_mul(PRIME1).wrapping_add(byte as u64);
-        }
-        for &byte in &data[data.len()-64..] {
-            hash = hash.wrapping_mul(PRIME2).wrapping_add(byte as u64);
-        }
-    }
-
-    hash
+    xxhash_rust::xxh3::xxh3_64(data)
 }
 
 /// Generate a signature for a file
@@ -236,5 +206,72 @@ mod tests {
         let sig = generate_signature(file.path(), 5 * 1024 * 1024).unwrap();
         assert_eq!(sig.file_size, 0);
         assert!(sig.blocks.is_empty());
+    }
+
+    #[test]
+    fn test_quick_hash_deterministic() {
+        let data = vec![0u8; 5 * 1024 * 1024]; // 5MB
+        let h1 = quick_hash(&data);
+        let h2 = quick_hash(&data);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_quick_hash_different_data() {
+        let size = 5 * 1024 * 1024;
+        let data1 = vec![0u8; size];
+        let mut data2 = data1.clone();
+
+        // Change any byte - xxHash3 hashes full block so any change is detected
+        data2[12345] = 1;
+        assert_ne!(quick_hash(&data1), quick_hash(&data2));
+    }
+
+    #[test]
+    fn test_quick_hash_boundary_changes() {
+        let data1 = vec![0u8; 5 * 1024 * 1024];
+
+        // Change at start
+        let mut data2 = data1.clone();
+        data2[0] = 1;
+        assert_ne!(quick_hash(&data1), quick_hash(&data2));
+
+        // Change at end
+        let mut data3 = data1.clone();
+        data3[5 * 1024 * 1024 - 1] = 1;
+        assert_ne!(quick_hash(&data1), quick_hash(&data3));
+
+        // Change in middle
+        let mut data4 = data1.clone();
+        data4[2 * 1024 * 1024] = 1;
+        assert_ne!(quick_hash(&data1), quick_hash(&data4));
+    }
+
+    #[test]
+    fn test_quick_hash_small_data() {
+        let data = b"small data";
+        let h1 = quick_hash(data);
+        let h2 = quick_hash(data);
+        assert_eq!(h1, h2);
+
+        let other = b"other data";
+        assert_ne!(quick_hash(data), quick_hash(other));
+    }
+
+    #[test]
+    fn test_quick_hash_speed() {
+        // xxHash3 should be very fast - this is a sanity check
+        // Note: debug mode is ~10x slower than release
+        let data = vec![0u8; 5 * 1024 * 1024]; // 5MB
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let _ = quick_hash(&data);
+        }
+        let elapsed = start.elapsed();
+        // 10 iterations of 5MB: ~5ms release, ~500ms debug
+        #[cfg(debug_assertions)]
+        assert!(elapsed.as_millis() < 1000, "xxHash3 too slow in debug: {:?}", elapsed);
+        #[cfg(not(debug_assertions))]
+        assert!(elapsed.as_millis() < 50, "xxHash3 too slow in release: {:?}", elapsed);
     }
 }

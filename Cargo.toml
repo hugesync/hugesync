@@ -5,7 +5,7 @@ edition = "2021"
 description = "A Cloud-Era Delta Synchronization Tool"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hugesync/hugesync"
-keywords = ["sync", "s3", "delta", "rsync", "cloud"]
+keywords = ["sync", "s3", "delta", "sftp", "hsync", "hugesync", "rsync", "cloud"]
 categories = ["command-line-utilities", "filesystem"]
 
 [[bin]]
@@ -54,6 +54,7 @@ time = "0.3"
 # Delta & Cryptography
 fast_rsync = "0.2"
 blake3 = { version = "1", features = ["rayon", "mmap"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hex = "0.4"
 base64 = "0.22"
 bitcode = { version = "0.6", features = ["serde"] }  # Fast binary serialization

@@ -1,0 +1,42 @@
+# Cargo build configuration for HugeSync
+#
+# SIMD STRATEGY:
+# The binary uses RUNTIME detection for SIMD features (AVX2, AVX-512, NEON).
+# This means a single binary works on all machines:
+# - On AVX-512 machines: uses AVX-512 instructions
+# - On AVX2 machines: uses AVX2 instructions
+# - On ARM64: uses NEON instructions
+# - On older machines: uses scalar fallback
+#
+# DO NOT set target-cpu=native globally - it breaks portability!
+# The #[target_feature] attributes on SIMD functions handle this correctly.
+
+[build]
+# Use all available CPU cores for compilation
+jobs = -1
+
+[profile.release]
+# Already configured in Cargo.toml
+
+# =============================================================================
+# OPTIONAL: Platform-specific optimizations
+# =============================================================================
+
+# Uncomment for x86_64 Linux builds (enables some baseline optimizations)
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "target-feature=+sse2"]
+
+# Uncomment for Apple Silicon (M1/M2/M3) - NEON is always available
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "target-cpu=apple-m1"]
+
+# =============================================================================
+# NATIVE BUILD (NOT PORTABLE - use only for local deployment)
+# =============================================================================
+# If you want maximum performance and will ONLY run on this exact machine:
+#
+# cargo build --release
+# RUSTFLAGS="-C target-cpu=native" cargo build --release
+#
+# WARNING: The resulting binary will CRASH on machines without the same CPU features!
+# Only use this for containers/VMs where you control the exact hardware.
