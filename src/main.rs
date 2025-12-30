@@ -124,10 +124,12 @@ fn run_sign(args: SignArgs) -> anyhow::Result<()> {
 }
 
 fn init_tracing(verbose: u8, json: bool) {
+    // Default to warn level for quiet operation in release builds
+    // Use -v for info, -vv for debug, -vvv for trace
     let filter = match verbose {
-        0 => EnvFilter::new("hugesync=info"),
-        1 => EnvFilter::new("hugesync=debug"),
-        2 => EnvFilter::new("hugesync=trace"),
+        0 => EnvFilter::new("hugesync=warn"),
+        1 => EnvFilter::new("hugesync=info"),
+        2 => EnvFilter::new("hugesync=debug"),
         _ => EnvFilter::new("trace"),
     };
 
@@ -139,7 +141,7 @@ fn init_tracing(verbose: u8, json: bool) {
     } else {
         tracing_subscriber::registry()
             .with(filter)
-            .with(fmt::layer().pretty())
+            .with(fmt::layer().compact())  // Use compact format for less overhead
             .init();
     }
 }

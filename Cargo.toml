@@ -68,7 +68,8 @@ dialoguer = "0.12"
 human_bytes = "0.4"
 
 # Observability & Error Handling
-tracing = "0.1"
+# release_max_level_info strips debug/trace logs at compile time in release builds
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 anyhow = "1"
 thiserror = "2"
