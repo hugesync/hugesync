@@ -23,6 +23,7 @@ futures = "0.3"
 num_cpus = "1"
 rayon = "1"
 bytes = "1"
+dashmap = "6"  # Concurrent HashMap for parallel scanning
 
 # Filesystem & Walking
 jwalk = "0.8"

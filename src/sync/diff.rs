@@ -10,9 +10,11 @@
 //! - --modify-window: Compare mtimes with tolerance
 
 use crate::config::Config;
-use crate::sync::scan::build_file_map;
+use crate::sync::scan::{build_file_map, FileMap};
 use crate::types::{FileEntry, PlannedAction, SyncAction};
+use dashmap::DashSet;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Compute the diff between source and destination files
@@ -125,6 +127,214 @@ pub fn compute_diff(
                 actions.push(PlannedAction::new(dest_entry.clone(), SyncAction::Delete));
             }
         }
+    }
+
+    actions
+}
+
+/// Compute the diff between source and destination using DashMaps
+///
+/// This is more efficient than `compute_diff` for large directories as it avoids
+/// the overhead of building HashMaps from Vecs. The DashMaps are built during
+/// parallel scanning.
+pub fn compute_diff_maps(
+    source_map: &Arc<FileMap>,
+    dest_map: &Arc<FileMap>,
+    config: &Config,
+) -> Vec<PlannedAction> {
+    let mut actions = Vec::with_capacity(source_map.len());
+
+    // Process source files - check what needs to be uploaded/updated
+    for entry in source_map.iter() {
+        let source_entry = entry.value();
+
+        // Skip files outside size limits
+        if !source_entry.is_dir && !config.file_within_size_limits(source_entry.size) {
+            tracing::debug!(
+                path = %source_entry.path.display(),
+                size = source_entry.size,
+                "Skipping file outside size limits"
+            );
+            continue;
+        }
+
+        let path_str = entry.key();
+
+        if source_entry.is_dir {
+            // Create directories at destination
+            if !dest_map.contains_key(path_str) {
+                actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Mkdir));
+            }
+            continue;
+        }
+
+        match dest_map.get(path_str) {
+            None => {
+                // File doesn't exist at destination
+                if config.existing {
+                    tracing::debug!(
+                        path = %source_entry.path.display(),
+                        "Skipping new file (--existing)"
+                    );
+                    continue;
+                }
+
+                // New file - upload
+                actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Upload));
+            }
+            Some(dest_ref) => {
+                let dest_entry = dest_ref.value();
+
+                // --ignore-existing: Skip files that exist on receiver
+                if config.ignore_existing {
+                    tracing::debug!(
+                        path = %source_entry.path.display(),
+                        "Skipping existing file (--ignore-existing)"
+                    );
+                    actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
+                    continue;
+                }
+
+                // --update: Skip files newer on receiver
+                if config.update && is_dest_newer(source_entry, dest_entry, config.modify_window) {
+                    tracing::debug!(
+                        path = %source_entry.path.display(),
+                        "Skipping file newer on receiver (--update)"
+                    );
+                    actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
+                    continue;
+                }
+
+                // Check if files match based on comparison mode
+                let matches = if config.checksum {
+                    files_match_checksum(source_entry, dest_entry)
+                } else if config.size_only {
+                    files_match_size_only(source_entry, dest_entry)
+                } else {
+                    files_match_mtime_size(source_entry, dest_entry, config.modify_window)
+                };
+
+                if matches {
+                    actions.push(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
+                } else {
+                    // File differs - use delta for large files if supported
+                    let action = if config.should_use_delta(source_entry.size) {
+                        SyncAction::Delta
+                    } else {
+                        SyncAction::Upload
+                    };
+                    actions.push(PlannedAction::new(source_entry.clone(), action));
+                }
+            }
+        }
+    }
+
+    // Check for files to delete (if --delete is enabled)
+    if config.delete {
+        // Build a DashSet of source paths for O(1) lookup
+        let source_paths: DashSet<String> = DashSet::with_capacity(source_map.len());
+        source_map.iter().for_each(|entry| {
+            source_paths.insert(entry.key().clone());
+        });
+
+        for entry in dest_map.iter() {
+            let path_str = entry.key();
+            if !source_paths.contains(path_str) {
+                actions.push(PlannedAction::new(entry.value().clone(), SyncAction::Delete));
+            }
+        }
+    }
+
+    actions
+}
+
+/// Compute diff in parallel using rayon (for very large directories)
+///
+/// This processes source entries in parallel and collects results.
+/// Best for directories with 10,000+ files.
+pub fn compute_diff_maps_parallel(
+    source_map: &Arc<FileMap>,
+    dest_map: &Arc<FileMap>,
+    config: &Config,
+) -> Vec<PlannedAction> {
+    use rayon::prelude::*;
+
+    // Collect source entries for parallel processing
+    let source_entries: Vec<_> = source_map.iter().collect();
+
+    // Process in parallel
+    let mut actions: Vec<PlannedAction> = source_entries
+        .into_par_iter()
+        .filter_map(|entry| {
+            let source_entry = entry.value();
+            let path_str = entry.key();
+
+            // Skip files outside size limits
+            if !source_entry.is_dir && !config.file_within_size_limits(source_entry.size) {
+                return None;
+            }
+
+            if source_entry.is_dir {
+                if !dest_map.contains_key(path_str) {
+                    return Some(PlannedAction::new(source_entry.clone(), SyncAction::Mkdir));
+                }
+                return None;
+            }
+
+            match dest_map.get(path_str) {
+                None => {
+                    if config.existing {
+                        return None;
+                    }
+                    Some(PlannedAction::new(source_entry.clone(), SyncAction::Upload))
+                }
+                Some(dest_ref) => {
+                    let dest_entry = dest_ref.value();
+
+                    if config.ignore_existing {
+                        return Some(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
+                    }
+
+                    if config.update && is_dest_newer(source_entry, dest_entry, config.modify_window) {
+                        return Some(PlannedAction::new(source_entry.clone(), SyncAction::Skip));
+                    }
+
+                    let matches = if config.checksum {
+                        files_match_checksum(source_entry, dest_entry)
+                    } else if config.size_only {
+                        files_match_size_only(source_entry, dest_entry)
+                    } else {
+                        files_match_mtime_size(source_entry, dest_entry, config.modify_window)
+                    };
+
+                    if matches {
+                        Some(PlannedAction::new(source_entry.clone(), SyncAction::Skip))
+                    } else {
+                        let action = if config.should_use_delta(source_entry.size) {
+                            SyncAction::Delta
+                        } else {
+                            SyncAction::Upload
+                        };
+                        Some(PlannedAction::new(source_entry.clone(), action))
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // Handle deletions
+    if config.delete {
+        let delete_actions: Vec<_> = dest_map
+            .iter()
+            .filter_map(|entry| {
+                if !source_map.contains_key(entry.key()) {
+                    Some(PlannedAction::new(entry.value().clone(), SyncAction::Delete))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        actions.extend(delete_actions);
     }
 
     actions
@@ -373,5 +583,64 @@ mod tests {
         let actions = compute_diff(&source, &dest, &config);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].action, SyncAction::Upload); // Not Delta
+    }
+
+    // DashMap-based tests
+    fn make_file_map(entries: Vec<FileEntry>) -> Arc<FileMap> {
+        let map = Arc::new(FileMap::new());
+        for entry in entries {
+            let path = entry.path.to_string_lossy().to_string();
+            map.insert(path, entry);
+        }
+        map
+    }
+
+    #[test]
+    fn test_dashmap_new_files() {
+        let source_map = make_file_map(vec![make_entry("file1.txt", 100)]);
+        let dest_map = make_file_map(vec![]);
+        let config = Config::default();
+
+        let actions = compute_diff_maps(&source_map, &dest_map, &config);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, SyncAction::Upload);
+    }
+
+    #[test]
+    fn test_dashmap_unchanged_files() {
+        let entry = make_entry("file1.txt", 100);
+        let source_map = make_file_map(vec![entry.clone()]);
+        let dest_map = make_file_map(vec![entry]);
+        let config = Config::default();
+
+        let actions = compute_diff_maps(&source_map, &dest_map, &config);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, SyncAction::Skip);
+    }
+
+    #[test]
+    fn test_dashmap_delete() {
+        let source_map = make_file_map(vec![]);
+        let dest_map = make_file_map(vec![make_entry("old_file.txt", 50)]);
+        let mut config = Config::default();
+        config.delete = true;
+
+        let actions = compute_diff_maps(&source_map, &dest_map, &config);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, SyncAction::Delete);
+    }
+
+    #[test]
+    fn test_dashmap_parallel_basic() {
+        let source_map = make_file_map(vec![
+            make_entry("file1.txt", 100),
+            make_entry("file2.txt", 200),
+        ]);
+        let dest_map = make_file_map(vec![]);
+        let config = Config::default();
+
+        let actions = compute_diff_maps_parallel(&source_map, &dest_map, &config);
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|a| a.action == SyncAction::Upload));
     }
 }
