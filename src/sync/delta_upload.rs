@@ -43,9 +43,10 @@ pub async fn delta_upload(
 ) -> Result<DeltaUploadResult> {
     // Step 1: Try to get remote signature
     let sig_path = format!("{}.hssig", remote_path);
+    tracing::debug!("Fetching remote signature from {}", sig_path);
     let remote_sig = match storage.get(&sig_path).await {
         Ok(data) => {
-            tracing::debug!(path = %sig_path, "Found remote signature");
+            tracing::debug!(path = %sig_path, size = data.len(), "Found remote signature");
             Some(read_signature_from_bytes(&data)?)
         }
         Err(_) => {
@@ -64,13 +65,24 @@ pub async fn delta_upload(
     };
 
     // Step 3: Read local file using memory mapping with file locking to avoid OOM and SIGBUS
+    tracing::debug!("Memory mapping local file");
     let mmap = LockedMmap::open(local_path)?;
 
     // Explicitly treat mmap as slice
     let local_data: &[u8] = &mmap;
-    
+    tracing::debug!(size = local_data.len(), "Local file mapped");
+
     // Use the O(N) rolling checksum algorithm
+    tracing::debug!("Computing delta with rolling checksum");
+    let start = std::time::Instant::now();
     let delta = compute_delta_rolling(local_data, &remote_sig)?;
+    tracing::debug!(
+        elapsed_ms = start.elapsed().as_millis(),
+        bytes_reused = delta.bytes_reused,
+        bytes_new = delta.bytes_new,
+        ops_count = delta.operations.len(),
+        "Delta computation complete"
+    );
 
     // Step 4: Check if delta is beneficial
     if !delta.is_beneficial() {
@@ -113,19 +125,43 @@ async fn delta_upload_multipart(
     config: &Config,
 ) -> Result<DeltaUploadResult> {
     // 1. Coalesce small adjacent operations into larger ones
+    tracing::debug!("Coalescing {} delta operations", delta.operations.len());
     let coalesced_ops = coalesce_operations(delta, S3_MIN_PART_SIZE);
-    
+    tracing::debug!("Coalesced to {} operations", coalesced_ops.len());
+
     // 2. Prepare parts ensuring S3 compatibility (padding/merging/splitting)
+    tracing::debug!("Preparing S3 parts");
     let parts = prepare_for_s3_upload(&coalesced_ops, local_data, delta.target_size);
-    
+    tracing::debug!("Prepared {} S3 parts", parts.len());
+
     if parts.is_empty() {
-        return Err(Error::Delta { 
-            message: "No parts to upload after coalescing".to_string() 
+        return Err(Error::Delta {
+            message: "No parts to upload after coalescing".to_string()
         });
     }
-    
+
+    // Log part details
+    for (i, part) in parts.iter().enumerate() {
+        match &part.content {
+            PartContent::CopyRange { source_offset, length } => {
+                tracing::debug!(
+                    "Part {}: CopyRange offset={} length={} ({:.2}MB)",
+                    i + 1, source_offset, length, *length as f64 / 1024.0 / 1024.0
+                );
+            }
+            PartContent::Upload { data } => {
+                tracing::debug!(
+                    "Part {}: Upload size={} ({:.2}MB)",
+                    i + 1, data.len(), data.len() as f64 / 1024.0 / 1024.0
+                );
+            }
+        }
+    }
+
     // Create multipart upload
+    tracing::debug!("Creating multipart upload");
     let upload_id = storage.create_multipart_upload(remote_path).await?;
+    tracing::debug!(upload_id = %upload_id, "Multipart upload created");
     
     let mut completed_parts = Vec::new();
     let mut bytes_transferred = 0u64;
@@ -134,21 +170,25 @@ async fn delta_upload_multipart(
     let mut parts_copied = 0;
 
     // Process each part
-    for part in parts {
+    let total_parts = parts.len();
+    for (idx, part) in parts.into_iter().enumerate() {
         let part_number = part.part_number;
 
         match part.content {
             PartContent::CopyRange { source_offset, length } => {
                 let source_end = source_offset + length - 1;
-                
-                tracing::debug!(
+
+                tracing::info!(
                     part = part_number,
+                    progress = format!("{}/{}", idx + 1, total_parts),
                     source_start = source_offset,
                     source_end = source_end,
-                    length = length,
+                    length_mb = format!("{:.2}", length as f64 / 1024.0 / 1024.0),
                     "Copying part from source"
                 );
-                
+
+                let start = std::time::Instant::now();
+
                 // For GCS/Azure/S3, usually source is the same path
                 // If we were syncing *across* files, this would be different
                 let completed = storage.upload_part_copy(
@@ -160,18 +200,27 @@ async fn delta_upload_multipart(
                     source_end,
                 ).await?;
 
+                tracing::debug!(
+                    part = part_number,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Part copy complete"
+                );
+
                 completed_parts.push(completed);
                 bytes_reused += length;
                 parts_copied += 1;
             }
             PartContent::Upload { data } => {
-                tracing::debug!(
+                tracing::info!(
                     part = part_number,
-                    size = data.len(),
+                    progress = format!("{}/{}", idx + 1, total_parts),
+                    size_mb = format!("{:.2}", data.len() as f64 / 1024.0 / 1024.0),
                     "Uploading new data"
                 );
 
+                let start = std::time::Instant::now();
                 let len = data.len() as u64;
+
                 // data is already Bytes - zero-copy transfer
                 let completed = storage.upload_part(
                     remote_path,
@@ -179,6 +228,12 @@ async fn delta_upload_multipart(
                     part_number,
                     data,
                 ).await?;
+
+                tracing::debug!(
+                    part = part_number,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Part upload complete"
+                );
 
                 completed_parts.push(completed);
                 bytes_transferred += len;

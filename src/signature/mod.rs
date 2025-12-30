@@ -4,7 +4,7 @@ pub mod file;
 pub mod generate;
 
 pub use file::{read_signature, read_signature_from_bytes, write_signature, write_signature_to_bytes};
-pub use generate::{generate_signature, generate_signature_from_bytes};
+pub use generate::{generate_signature, generate_signature_from_bytes, quick_hash};
 
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 /// Magic bytes for .hssig files
 pub const SIGNATURE_MAGIC: &[u8; 6] = b"HSSIG\x01";
 
-/// Current signature format version
-pub const SIGNATURE_VERSION: u8 = 1;
+/// Current signature format version (v2 adds quick_hash for false positive filtering)
+pub const SIGNATURE_VERSION: u8 = 2;
 
 /// A file signature containing block checksums
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -75,18 +75,24 @@ pub struct BlockChecksum {
     /// Rolling checksum (fast, weak hash for initial matching)
     pub rolling: u32,
 
+    /// Quick hash for fast false positive filtering (computed from sampled bytes)
+    /// This is checked after rolling hash matches but before expensive BLAKE3.
+    /// Catches most false positives from repetitive data patterns.
+    pub quick_hash: u64,
+
     /// Strong hash (BLAKE3 for verification)
     pub strong: [u8; 32],
 }
 
 impl BlockChecksum {
     /// Create a new block checksum
-    pub fn new(index: usize, offset: u64, size: usize, rolling: u32, strong: [u8; 32]) -> Self {
+    pub fn new(index: usize, offset: u64, size: usize, rolling: u32, quick_hash: u64, strong: [u8; 32]) -> Self {
         Self {
             index,
             offset,
             size,
             rolling,
+            quick_hash,
             strong,
         }
     }

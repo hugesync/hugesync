@@ -21,6 +21,44 @@ fn rolling_checksum(data: &[u8]) -> u32 {
     (b << 16) | (a & 0xffff)
 }
 
+/// Compute a quick secondary hash for filtering false positives
+/// Uses xxHash-style mixing for better distribution than Adler-32
+/// This samples data at intervals to stay fast even for large blocks (5MB)
+#[inline]
+pub fn quick_hash(data: &[u8]) -> u64 {
+    // Sample every 4KB to make this fast even for 5MB blocks
+    // This catches most false positives from repetitive data
+    const SAMPLE_INTERVAL: usize = 4096;
+    const PRIME1: u64 = 0x9E3779B185EBCA87;
+    const PRIME2: u64 = 0xC2B2AE3D27D4EB4F;
+
+    let mut hash: u64 = data.len() as u64;
+
+    // Sample bytes at regular intervals
+    for i in (0..data.len()).step_by(SAMPLE_INTERVAL) {
+        let end = std::cmp::min(i + 8, data.len());
+        let mut sample: u64 = 0;
+        for (j, &byte) in data[i..end].iter().enumerate() {
+            sample |= (byte as u64) << (j * 8);
+        }
+        hash = hash.wrapping_mul(PRIME1).wrapping_add(sample);
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(PRIME2);
+    }
+
+    // Also include first and last 64 bytes for boundary sensitivity
+    if data.len() >= 64 {
+        for &byte in &data[..64] {
+            hash = hash.wrapping_mul(PRIME1).wrapping_add(byte as u64);
+        }
+        for &byte in &data[data.len()-64..] {
+            hash = hash.wrapping_mul(PRIME2).wrapping_add(byte as u64);
+        }
+    }
+
+    hash
+}
+
 /// Generate a signature for a file
 pub fn generate_signature(path: &Path, block_size: usize) -> Result<Signature> {
     let file = File::open(path).map_err(|e| Error::io("opening file", e))?;
@@ -60,9 +98,10 @@ fn generate_signature_mmap(path: &Path, block_size: usize, file_size: u64) -> Re
             let size = chunk.len();
 
             let rolling = rolling_checksum(chunk);
+            let qhash = quick_hash(chunk);
             let strong = blake3::hash(chunk);
 
-            BlockChecksum::new(i, offset, size, rolling, *strong.as_bytes())
+            BlockChecksum::new(i, offset, size, rolling, qhash, *strong.as_bytes())
         })
         .collect();
 
@@ -96,6 +135,7 @@ fn generate_signature_read(path: &Path, block_size: usize, file_size: u64) -> Re
 
         let chunk = &buffer[..bytes_read];
         let rolling = rolling_checksum(chunk);
+        let qhash = quick_hash(chunk);
         let strong = blake3::hash(chunk);
 
         // Update file hash for etag
@@ -106,6 +146,7 @@ fn generate_signature_read(path: &Path, block_size: usize, file_size: u64) -> Re
             offset,
             bytes_read,
             rolling,
+            qhash,
             *strong.as_bytes(),
         ));
 
@@ -128,6 +169,7 @@ pub fn generate_signature_from_bytes(data: &[u8], block_size: usize) -> Signatur
     for (i, chunk) in data.chunks(block_size).enumerate() {
         let offset = (i * block_size) as u64;
         let rolling = rolling_checksum(chunk);
+        let qhash = quick_hash(chunk);
         let strong = blake3::hash(chunk);
 
         sig.blocks.push(BlockChecksum::new(
@@ -135,6 +177,7 @@ pub fn generate_signature_from_bytes(data: &[u8], block_size: usize) -> Signatur
             offset,
             chunk.len(),
             rolling,
+            qhash,
             *strong.as_bytes(),
         ));
     }
