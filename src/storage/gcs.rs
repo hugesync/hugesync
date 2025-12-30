@@ -5,18 +5,18 @@ use crate::storage::{ByteStream, CompletedPart};
 use crate::types::FileEntry;
 use bytes::Bytes;
 use futures::StreamExt;
-use object_store::gcp::{GoogleCloudStorage, GoogleCloudStorageBuilder};
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Google Cloud Storage backend
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GcsBackend {
-    /// Object store client (concrete type)
-    store: std::sync::Arc<GoogleCloudStorage>,
-    /// Bucket name (for reference)
-    #[allow(dead_code)]
+    /// Object store instance
+    store: Arc<dyn ObjectStore>,
+    /// Bucket name (for error messages)
     bucket: String,
     /// Prefix (like a subdirectory)
     prefix: String,
@@ -25,7 +25,7 @@ pub struct GcsBackend {
 impl GcsBackend {
     /// Create a new GCS backend
     pub async fn new(bucket: String, prefix: String) -> Result<Self> {
-        let store = GoogleCloudStorageBuilder::new()
+        let store = GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(&bucket)
             .build()
             .map_err(|e| Error::Gcs {
@@ -33,33 +33,33 @@ impl GcsBackend {
             })?;
 
         Ok(Self {
-            store: std::sync::Arc::new(store),
+            store: Arc::new(store),
             bucket,
             prefix,
         })
     }
 
-    /// Resolve a relative path to a full GCS key
+    /// Resolve a relative path to a full object_store Path
     fn resolve_key(&self, path: &str) -> ObjectPath {
-        let full_path = if self.prefix.is_empty() {
-            path.to_string()
+        if self.prefix.is_empty() {
+            ObjectPath::from(path)
         } else if path.is_empty() {
-            self.prefix.clone()
+            ObjectPath::from(self.prefix.as_str())
         } else {
-            format!("{}/{}", self.prefix.trim_end_matches('/'), path)
-        };
-        ObjectPath::from(full_path)
+            ObjectPath::from(format!("{}/{}", self.prefix.trim_end_matches('/'), path))
+        }
     }
 
     /// Strip prefix from a full key to get relative path
-    fn strip_prefix(&self, key: &str) -> String {
+    fn strip_prefix(&self, key: &ObjectPath) -> String {
+        let key_str = key.to_string();
         if self.prefix.is_empty() {
-            key.to_string()
+            key_str
         } else {
             let prefix_with_slash = format!("{}/", self.prefix.trim_end_matches('/'));
-            key.strip_prefix(&prefix_with_slash)
-                .or_else(|| key.strip_prefix(&self.prefix))
-                .unwrap_or(key)
+            key_str.strip_prefix(&prefix_with_slash)
+                .or_else(|| key_str.strip_prefix(&self.prefix))
+                .unwrap_or(&key_str)
                 .to_string()
         }
     }
@@ -76,7 +76,7 @@ impl GcsBackend {
                 message: format!("Failed to list objects: {}", e),
             })?;
 
-            let relative = self.strip_prefix(meta.location.as_ref());
+            let relative = self.strip_prefix(&meta.location);
             if relative.is_empty() {
                 continue;
             }
@@ -120,15 +120,17 @@ impl GcsBackend {
     pub async fn get(&self, path: &str) -> Result<Bytes> {
         let key = self.resolve_key(path);
 
-        let result = self.store.get(&key).await.map_err(|e| Error::Gcs {
-            message: format!("Failed to download object: {}", e),
-        })?;
-
-        let bytes = result.bytes().await.map_err(|e| Error::Gcs {
-            message: format!("Failed to read object bytes: {}", e),
-        })?;
-
-        Ok(bytes)
+        self.store
+            .get(&key)
+            .await
+            .map_err(|e| Error::Gcs {
+                message: format!("Failed to download object: {}", e),
+            })?
+            .bytes()
+            .await
+            .map_err(|e| Error::Gcs {
+                message: format!("Failed to read object bytes: {}", e),
+            })
     }
 
     /// Read a file as a stream of chunks (memory-efficient for large files)
@@ -142,7 +144,6 @@ impl GcsBackend {
         })?;
 
         // Use a channel to bridge the non-Sync object_store stream to our Sync ByteStream
-        // This spawns a task to forward chunks, maintaining on-demand streaming
         let (mut tx, rx) = mpsc::channel::<Result<Bytes>>(2);
 
         let mut obj_stream = result.into_stream();
@@ -164,20 +165,13 @@ impl GcsBackend {
     /// Read a range of bytes from a file
     pub async fn get_range(&self, path: &str, start: u64, end: u64) -> Result<Bytes> {
         let key = self.resolve_key(path);
-        let range = std::ops::Range {
-            start: start,
-            end: end + 1,
-        };
 
-        let bytes = self
-            .store
-            .get_range(&key, range)
+        self.store
+            .get_range(&key, start..end + 1)
             .await
             .map_err(|e| Error::Gcs {
                 message: format!("Failed to download object range: {}", e),
-            })?;
-
-        Ok(bytes)
+            })
     }
 
     /// Write a file's contents
@@ -185,7 +179,7 @@ impl GcsBackend {
         let key = self.resolve_key(path);
 
         self.store
-            .put(&key, data.into())
+            .put(&key, PutPayload::from(data))
             .await
             .map_err(|e| Error::Gcs {
                 message: format!("Failed to upload object: {}", e),
@@ -194,31 +188,21 @@ impl GcsBackend {
         Ok(())
     }
 
-    /// Write a file from a stream of chunks using multipart upload
+    /// Write a file from a stream of chunks
     pub async fn put_stream(
         &self,
         path: &str,
         mut stream: ByteStream,
         _size_hint: Option<u64>,
     ) -> Result<()> {
-        let key = self.resolve_key(path);
-
-        let upload = self.store.put_multipart(&key).await.map_err(|e| Error::Gcs {
-            message: format!("Failed to start multipart upload: {}", e),
-        })?;
-
-        let mut writer = WriteMultipart::new(upload);
-
+        // Collect stream into bytes - object_store's multipart upload requires
+        // knowing the size upfront for optimal chunking
+        let mut data = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let data = chunk?;
-            writer.write(&data);
+            data.extend_from_slice(&chunk?);
         }
 
-        writer.finish().await.map_err(|e| Error::Gcs {
-            message: format!("Failed to complete multipart upload: {}", e),
-        })?;
-
-        Ok(())
+        self.put(path, Bytes::from(data)).await
     }
 
     /// Delete a file

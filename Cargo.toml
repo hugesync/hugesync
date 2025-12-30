@@ -33,7 +33,7 @@ fs2 = "0.4"  # Cross-platform file locking
 ignore = "0.4"
 
 # Cloud & Network - AWS
-object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
+object_store = { version = "0.13", features = ["gcp"] }
 aws-sdk-s3 = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 
