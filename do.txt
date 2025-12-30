@@ -70,11 +70,16 @@ SECTION 3: URI PARSING & STORAGE ABSTRACTION
     - Implement UploadPartCopy for delta stitching
     - Handle multipart uploads
 
-[ ] 3.5 Create src/storage/gcs.rs - Google Cloud Storage backend
-    - (Deferred) GCS compose support
+[x] 3.5 Create src/storage/gcs.rs - Google Cloud Storage backend
+    - Uses object_store crate (gcp feature only)
+    - Full list/head/get/put/delete operations
+    - Streaming via channel bridge for memory efficiency
+    - Supports GCS compose for large objects
 
-[ ] 3.6 Create src/storage/azure.rs - Azure Blob Storage backend
-    - (Deferred) Azure Block List support
+[x] 3.6 Create src/storage/azure.rs - Azure Blob Storage backend
+    - Native azure_storage_blobs SDK
+    - Full Blob Storage operations
+    - Block list support for delta stitching
 
 [x] 3.7 Create src/storage/ssh.rs - SSH/SFTP backend
     - Pure Rust SSH via russh/russh-sftp
@@ -362,6 +367,16 @@ CODE QUALITY OBSERVATIONS:
    - Files < 8MB: Simple in-memory transfer
    - Local source: Uses put_file() with memory-mapped streaming
    - Cloud-to-cloud: Streams chunks directly between backends
+
+STREAMING MEMORY OPTIMIZATIONS:
+----------------------------
+- All backends implement memory-efficient get_stream() for large files
+- S3: Uses into_async_read() + ReaderStream for on-demand chunk delivery
+- Local: Uses stream::unfold with Arc<LockedMmap> for lazy chunk copying
+- GCS: Uses channel bridge (mpsc) to convert non-Sync object_store stream
+- SSH: Uses stream::unfold with Arc<Mutex> around SFTP file handle
+- Avoids OOM by never buffering entire files in memory
+- Chunks delivered on-demand as consumer pulls from stream
 
 SSH STREAMING SUPPORT:
 ----------------------
