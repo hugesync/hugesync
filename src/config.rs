@@ -196,6 +196,14 @@ pub struct Config {
 
     /// Retry delay base in milliseconds
     pub retry_delay_ms: u64,
+
+    // ==================== Cloud Storage ====================
+
+    /// S3 storage class for uploads (STANDARD, STANDARD_IA, GLACIER, etc.)
+    pub storage_class: Option<String>,
+
+    /// Custom S3 endpoint for S3-compatible storage (Hetzner, MinIO, Backblaze, etc.)
+    pub s3_endpoint: Option<String>,
 }
 
 impl Default for Config {
@@ -277,6 +285,10 @@ impl Default for Config {
             // Retry
             max_retries: 3,
             retry_delay_ms: 1000,
+
+            // Cloud storage
+            storage_class: None,
+            s3_endpoint: None,
         }
     }
 }

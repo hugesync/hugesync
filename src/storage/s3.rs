@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::storage::{ByteStream, CompletedPart};
 use crate::types::FileEntry;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
+use aws_sdk_s3::types::StorageClass;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -17,19 +18,79 @@ pub struct S3Backend {
     bucket: String,
     /// Prefix (like a subdirectory)
     prefix: String,
+    /// Storage class for uploads (STANDARD, GLACIER, etc.)
+    storage_class: Option<StorageClass>,
 }
 
 impl S3Backend {
     /// Create a new S3 backend
     pub async fn new(bucket: String, prefix: String) -> Result<Self> {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = Client::new(&config);
+        Self::with_storage_class(bucket, prefix, None).await
+    }
+
+    /// Create a new S3 backend with a specific storage class and optional custom endpoint
+    pub async fn with_options(
+        bucket: String,
+        prefix: String,
+        storage_class: Option<String>,
+        endpoint: Option<String>,
+    ) -> Result<Self> {
+        let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+
+        let client = if let Some(ref endpoint_url) = endpoint {
+            // Custom endpoint for S3-compatible storage (Hetzner, MinIO, Backblaze, etc.)
+            let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+                .endpoint_url(endpoint_url)
+                .force_path_style(true) // Required for most S3-compatible providers
+                .build();
+            Client::from_conf(s3_config)
+        } else {
+            Client::new(&sdk_config)
+        };
+
+        // Only use storage class for AWS (no custom endpoint)
+        let storage_class = if endpoint.is_none() {
+            storage_class.map(|s| Self::parse_storage_class(&s))
+        } else {
+            None
+        };
 
         Ok(Self {
             client,
             bucket,
             prefix,
+            storage_class,
         })
+    }
+
+    /// Create a new S3 backend with a specific storage class (AWS only)
+    pub async fn with_storage_class(
+        bucket: String,
+        prefix: String,
+        storage_class: Option<String>,
+    ) -> Result<Self> {
+        Self::with_options(bucket, prefix, storage_class, None).await
+    }
+
+    /// Parse a storage class string into the SDK enum
+    fn parse_storage_class(s: &str) -> StorageClass {
+        match s.to_uppercase().as_str() {
+            "STANDARD" => StorageClass::Standard,
+            "REDUCED_REDUNDANCY" => StorageClass::ReducedRedundancy,
+            "STANDARD_IA" => StorageClass::StandardIa,
+            "ONEZONE_IA" => StorageClass::OnezoneIa,
+            "INTELLIGENT_TIERING" => StorageClass::IntelligentTiering,
+            "GLACIER" => StorageClass::Glacier,
+            "GLACIER_IR" => StorageClass::GlacierIr,
+            "DEEP_ARCHIVE" => StorageClass::DeepArchive,
+            "OUTPOSTS" => StorageClass::Outposts,
+            "EXPRESS_ONEZONE" => StorageClass::ExpressOnezone,
+            "SNOW" => StorageClass::Snow,
+            _ => {
+                tracing::warn!(storage_class = %s, "Unknown storage class, using STANDARD");
+                StorageClass::Standard
+            }
+        }
     }
 
     /// Resolve a relative path to a full S3 key
@@ -221,16 +282,21 @@ impl S3Backend {
     pub async fn put(&self, path: &str, data: Bytes) -> Result<()> {
         let key = self.resolve_key(path);
 
-        self.client
+        let mut request = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
-            .body(AwsByteStream::from(data))
-            .send()
-            .await
-            .map_err(|e| Error::Aws {
-                message: e.to_string(),
-            })?;
+            .body(AwsByteStream::from(data));
+
+        // Set storage class if configured
+        if let Some(ref sc) = self.storage_class {
+            request = request.storage_class(sc.clone());
+        }
+
+        request.send().await.map_err(|e| Error::Aws {
+            message: e.to_string(),
+        })?;
 
         Ok(())
     }
@@ -295,16 +361,20 @@ impl S3Backend {
     pub async fn create_multipart_upload(&self, path: &str) -> Result<String> {
         let key = self.resolve_key(path);
 
-        let output = self
+        let mut request = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| Error::Aws {
-                message: e.to_string(),
-            })?;
+            .key(&key);
+
+        // Set storage class if configured
+        if let Some(ref sc) = self.storage_class {
+            request = request.storage_class(sc.clone());
+        }
+
+        let output = request.send().await.map_err(|e| Error::Aws {
+            message: e.to_string(),
+        })?;
 
         output
             .upload_id()

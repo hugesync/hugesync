@@ -132,11 +132,15 @@ impl SyncEngine {
 pub async fn create_backends(
     source: &Location,
     dest: &Location,
+    config: &Config,
 ) -> Result<(StorageBackend, StorageBackend)> {
+    // Storage class and endpoint are only applied to destination (upload target)
     let source_backend = match source {
         Location::Local(path) => StorageBackend::local(path.clone()),
         Location::S3 { bucket, prefix } => {
-            StorageBackend::s3(bucket.clone(), prefix.clone()).await?
+            // Source S3: use endpoint but no storage class (not uploading)
+            StorageBackend::s3(bucket.clone(), prefix.clone(), None, config.s3_endpoint.clone())
+                .await?
         }
         Location::Gcs { bucket, prefix } => {
             StorageBackend::gcs(bucket.clone(), prefix.clone()).await?
@@ -152,7 +156,14 @@ pub async fn create_backends(
     let dest_backend = match dest {
         Location::Local(path) => StorageBackend::local(path.clone()),
         Location::S3 { bucket, prefix } => {
-            StorageBackend::s3(bucket.clone(), prefix.clone()).await?
+            // Dest S3: use both storage class and endpoint
+            StorageBackend::s3(
+                bucket.clone(),
+                prefix.clone(),
+                config.storage_class.clone(),
+                config.s3_endpoint.clone(),
+            )
+            .await?
         }
         Location::Gcs { bucket, prefix } => {
             StorageBackend::gcs(bucket.clone(), prefix.clone()).await?

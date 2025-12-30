@@ -17,6 +17,7 @@ pub mod mmap;
 pub mod progress;
 pub mod resume;
 pub mod retry;
+pub mod s3_providers;
 pub mod signature;
 pub mod storage;
 pub mod sync;

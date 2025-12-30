@@ -22,6 +22,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Sync(args) => run_sync(args).await,
         Commands::Sign(args) => run_sign(args),
         Commands::Config(args) => handle_config_command(args),
+        Commands::Providers => {
+            hugesync::s3_providers::print_providers_help();
+            Ok(())
+        }
     };
 
     drop(shutdown);
@@ -50,8 +54,25 @@ async fn run_sync(args: SyncArgs) -> anyhow::Result<()> {
         "Parsed locations"
     );
 
+    // Warn if storage class is specified but destination doesn't support it
+    if let Some(ref storage_class) = config.storage_class {
+        if dest_loc.scheme() != "s3" {
+            tracing::warn!(
+                storage_class = %storage_class,
+                dest_type = dest_loc.scheme(),
+                "--storage-class is only supported for S3 destinations (s3://), ignoring"
+            );
+        } else if config.s3_endpoint.is_some() {
+            tracing::warn!(
+                storage_class = %storage_class,
+                endpoint = ?config.s3_endpoint,
+                "--storage-class is only supported on AWS S3, not S3-compatible providers, ignoring"
+            );
+        }
+    }
+
     // Create storage backends
-    let (source, dest) = create_backends(&source_loc, &dest_loc).await?;
+    let (source, dest) = create_backends(&source_loc, &dest_loc, &config).await?;
 
     // Create and run sync engine
     let engine = SyncEngine::new(config, source, dest);

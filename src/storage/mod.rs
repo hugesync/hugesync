@@ -48,8 +48,15 @@ impl StorageBackend {
     }
 
     /// Create an S3 backend
-    pub async fn s3(bucket: String, prefix: String) -> Result<Self> {
-        Ok(StorageBackend::S3(S3Backend::new(bucket, prefix).await?))
+    pub async fn s3(
+        bucket: String,
+        prefix: String,
+        storage_class: Option<String>,
+        endpoint: Option<String>,
+    ) -> Result<Self> {
+        Ok(StorageBackend::S3(
+            S3Backend::with_options(bucket, prefix, storage_class, endpoint).await?,
+        ))
     }
 
     /// Create a GCS backend

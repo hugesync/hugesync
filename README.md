@@ -23,6 +23,124 @@ A cloud-era delta synchronization tool built in Rust. HugeSync efficiently syncs
 | Azure   | `az://container/prefix` | ✅ | ✅ Block List |
 | SSH     | `user@host:/path` | ✅ | ❌ (full transfer) |
 
+## Cloud Authentication
+
+HugeSync automatically detects credentials from your environment.
+
+### AWS S3
+Set standard AWS environment variables:
+```bash
+export AWS_ACCESS_KEY_ID="your_access_key"
+export AWS_SECRET_ACCESS_KEY="your_secret_key"
+export AWS_REGION="us-east-1"
+```
+
+### Google Cloud Storage (GCP)
+Use Application Default Credentials (ADC) via JSON key file:
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
+```
+
+### Azure Blob Storage
+Set storage account name and access key:
+```bash
+export AZURE_STORAGE_ACCOUNT="your_storage_account"
+export AZURE_STORAGE_KEY="your_access_key"
+```
+
+### SSH/SFTP
+Uses your standard SSH configuration:
+- Parses `~/.ssh/config`
+- Uses running `ssh-agent`
+- Tries default keys (id_rsa, id_ed25519)
+
+## S3-Compatible Providers
+
+HugeSync supports many S3-compatible storage providers with easy shorthand syntax.
+
+### Using Provider Shorthand
+
+Instead of typing full endpoint URLs, use `--s3-provider` and `--s3-region`:
+
+```bash
+# Hetzner Object Storage (Helsinki)
+hsync sync ./data s3://bucket/path --s3-provider hetzner --s3-region hel1
+
+# DigitalOcean Spaces (NYC)
+hsync sync ./data s3://bucket/path --s3-provider do --s3-region nyc3
+
+# Backblaze B2 (EU)
+hsync sync ./data s3://bucket/path --s3-provider b2 --s3-region eu-central-003
+
+# Wasabi (Frankfurt)
+hsync sync ./data s3://bucket/path --s3-provider wasabi --s3-region eu-central-1
+```
+
+### Supported Providers and Regions
+
+Run `hsync providers` to see all supported providers:
+
+| Provider | Alias | Regions |
+|----------|-------|---------|
+| Hetzner | `hetzner`, `htz` | fsn1, nbg1, hel1 |
+| DigitalOcean | `digitalocean`, `do`, `spaces` | nyc3, sfo3, ams3, sgp1, fra1, syd1 |
+| Backblaze B2 | `backblaze`, `b2` | us-west-000, us-west-001, us-west-002, us-west-004, eu-central-003 |
+| Wasabi | `wasabi` | us-east-1, us-east-2, us-central-1, us-west-1, eu-central-1, eu-central-2, eu-west-1, eu-west-2, ap-northeast-1, ap-northeast-2, ap-southeast-1, ap-southeast-2, ca-central-1 |
+| Vultr | `vultr` | ewr1, ord1, dfw1, sea1, lax1, atl1, ams1, lhr1, fra1, sjc1, syd1, jnb1, sgp1, nrt1, blr1, del1 |
+| Linode | `linode`, `akamai` | us-east-1, us-southeast-1, us-ord-1, eu-central-1, ap-south-1, us-iad-1, fr-par-1, se-sto-1, in-maa-1, jp-osa-1, it-mil-1, us-lax-1, us-mia-1, id-cgk-1, br-gru-1 |
+| Scaleway | `scaleway`, `scw` | fr-par, nl-ams, pl-waw |
+| OVHcloud | `ovh`, `ovhcloud` | gra, sbg, bhs, de, uk, waw, rbx-hdd, rbx-ssd |
+| Exoscale | `exoscale`, `exo` | ch-gva-2, ch-dk-2, de-fra-1, de-muc-1, at-vie-1, at-vie-2, bg-sof-1 |
+| IDrive e2 | `idrive`, `e2` | us-or, us-va, us-la, us-phx, us-dal, eu-fra, eu-lon, eu-par, ap-sin |
+| Contabo | `contabo` | eu, us-central, sin, aus, uk, jpn |
+
+### Custom Endpoints
+
+For providers not in the list or self-hosted solutions:
+
+```bash
+# Cloudflare R2 (requires account ID)
+hsync sync ./data s3://bucket/path --s3-endpoint https://ACCOUNT_ID.r2.cloudflarestorage.com
+
+# MinIO self-hosted
+hsync sync ./data s3://bucket/path --s3-endpoint http://localhost:9000
+
+# Any S3-compatible endpoint
+hsync sync ./data s3://bucket/path --s3-endpoint https://s3.custom-provider.com
+```
+
+## AWS S3 Storage Classes
+
+For AWS S3 destinations, you can specify storage classes to reduce costs:
+
+```bash
+# Standard (default)
+hsync sync ./data s3://bucket/backup/
+
+# Infrequent Access (40% cheaper, retrieval fees apply)
+hsync sync ./data s3://bucket/backup/ --storage-class STANDARD_IA
+
+# Glacier Instant Retrieval (68% cheaper)
+hsync sync ./data s3://bucket/backup/ --storage-class GLACIER_IR
+
+# Glacier Flexible Retrieval (for archives, minutes-hours retrieval)
+hsync sync ./data s3://bucket/backup/ --storage-class GLACIER
+
+# Deep Archive (cheapest, 12-48 hour retrieval)
+hsync sync ./data s3://bucket/backup/ --storage-class DEEP_ARCHIVE
+```
+
+**Note**: Storage classes only work with AWS S3, not S3-compatible providers. If you specify `--storage-class` with `--s3-provider` or `--s3-endpoint`, it will be ignored with a warning.
+
+| Storage Class | Cost Savings | Retrieval Time | Best For |
+|---------------|--------------|----------------|----------|
+| STANDARD | - | Instant | Frequently accessed |
+| STANDARD_IA | ~40% | Instant | Monthly access |
+| ONEZONE_IA | ~50% | Instant | Reproducible data |
+| GLACIER_IR | ~68% | Instant | Quarterly access |
+| GLACIER | ~78% | 1-12 hours | Archives |
+| DEEP_ARCHIVE | ~95% | 12-48 hours | Long-term archives |
+
 ## Installation
 
 ```bash
@@ -93,10 +211,11 @@ USAGE:
     hsync [OPTIONS] <COMMAND>
 
 COMMANDS:
-    sync    Synchronize files between source and destination
-    sign    Generate signature file for a large file
-    config  Show configuration
-    help    Print this message
+    sync       Synchronize files between source and destination
+    sign       Generate signature file for a large file
+    config     Show configuration
+    providers  List supported S3-compatible providers and regions
+    help       Print this message
 
 OPTIONS:
     -v, --verbose...  Increase logging verbosity
@@ -152,6 +271,13 @@ DELTA SYNC:
 FILTERING:
         --include=PATTERN      Include files matching pattern
         --exclude=PATTERN      Exclude files matching pattern
+
+CLOUD STORAGE:
+        --storage-class=CLASS  AWS S3 storage class (STANDARD, STANDARD_IA,
+                               GLACIER, GLACIER_IR, DEEP_ARCHIVE)
+        --s3-endpoint=URL      Custom S3-compatible endpoint URL
+        --s3-provider=NAME     S3 provider shorthand (hetzner, do, b2, wasabi...)
+        --s3-region=REGION     Region for the S3 provider
 ```
 
 ## Configuration

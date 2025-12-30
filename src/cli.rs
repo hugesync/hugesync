@@ -30,6 +30,9 @@ pub enum Commands {
 
     /// Show configuration
     Config(ConfigArgs),
+
+    /// List supported S3-compatible providers and their regions
+    Providers,
 }
 
 /// Arguments for the sync command
@@ -158,6 +161,28 @@ pub struct SyncArgs {
     /// Limit I/O bandwidth in KiB/s
     #[arg(long)]
     pub bwlimit: Option<u64>,
+
+    // ==================== Cloud Storage Options ====================
+
+    /// S3 storage class for uploads (STANDARD, STANDARD_IA, ONEZONE_IA,
+    /// INTELLIGENT_TIERING, GLACIER, GLACIER_IR, DEEP_ARCHIVE)
+    /// Note: Only supported on AWS S3, not S3-compatible providers
+    #[arg(long)]
+    pub storage_class: Option<String>,
+
+    /// Custom S3 endpoint URL for S3-compatible storage
+    /// (e.g., https://s3.us-west-001.backblazeb2.com, https://fsn1.your-objectstorage.com)
+    #[arg(long, conflicts_with_all = ["s3_provider", "s3_region"])]
+    pub s3_endpoint: Option<String>,
+
+    /// S3-compatible provider shorthand (hetzner, digitalocean, backblaze, wasabi,
+    /// vultr, linode, scaleway, ovh, exoscale, idrive, contabo)
+    #[arg(long, requires = "s3_region")]
+    pub s3_provider: Option<String>,
+
+    /// Region/datacenter for the S3 provider (e.g., hel1, nyc3, eu-central-1)
+    #[arg(long, requires = "s3_provider")]
+    pub s3_region: Option<String>,
 
     // ==================== Partial Transfer ====================
 
@@ -334,6 +359,25 @@ impl SyncArgs {
         }
         if !self.exclude.is_empty() {
             config.exclude = self.exclude.clone();
+        }
+
+        // Cloud storage options
+        if let Some(ref sc) = self.storage_class {
+            config.storage_class = Some(sc.to_uppercase());
+        }
+
+        // Resolve S3 endpoint: either direct URL or provider/region shorthand
+        if let Some(ref endpoint) = self.s3_endpoint {
+            config.s3_endpoint = Some(endpoint.clone());
+        } else if let (Some(ref provider), Some(ref region)) = (&self.s3_provider, &self.s3_region) {
+            // Resolve provider/region to endpoint URL
+            match crate::s3_providers::resolve_endpoint(provider, region) {
+                Ok(endpoint) => config.s3_endpoint = Some(endpoint),
+                Err(e) => {
+                    // Log error but don't fail here - let it fail later with better context
+                    tracing::error!("Failed to resolve S3 provider: {}", e);
+                }
+            }
         }
 
         config
