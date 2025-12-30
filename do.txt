@@ -378,6 +378,17 @@ STREAMING MEMORY OPTIMIZATIONS:
 - Avoids OOM by never buffering entire files in memory
 - Chunks delivered on-demand as consumer pulls from stream
 
+- Chunks delivered on-demand as consumer pulls from stream
+
+DELTA DOWNLOAD SUPPORT:
+-----------------------
+- Bidirectional delta sync (Cloud -> Local) implemented
+- Uses HTTP Range requests to fetch only changed blocks
+- Generates signature of local file, compares with remote .hssig
+- Reconstructs file atomically using local blocks + remote ranges
+- Falls back to full streaming download if not beneficial
+- Saves 99%+ bandwidth for small changes to large files
+
 SSH STREAMING SUPPORT:
 ----------------------
 - True streaming upload via put_stream() - writes chunks as they arrive

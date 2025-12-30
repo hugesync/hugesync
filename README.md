@@ -184,12 +184,18 @@ hsync config --init
 
 2. **Local Diffing**: When syncing, downloads the remote `.hssig`, compares blocks locally, and identifies changed blocks.
 
-3. **Delta Upload**: Uses cloud-native operations to stitch unchanged blocks from existing remote object with newly uploaded changed blocks:
+3. **Delta Upload (Local → Cloud)**: Uses cloud-native operations to stitch unchanged blocks from existing remote object with newly uploaded changed blocks:
    - S3: `UploadPartCopy`
    - GCS: `Compose`
    - Azure: Block List
 
-**Result**: 99%+ bandwidth savings for incremental updates to large files.
+4. **Delta Download (Cloud → Local)**:
+   - Generates signature of local file
+   - Compares with remote `.hssig`
+   - Fetches only changed blocks via HTTP Range requests
+   - Reconstructs file atomically from local blocks + remote ranges
+
+**Result**: 99%+ bandwidth savings for incremental updates (upload AND download) to large files.
 
 ## Memory Efficiency
 

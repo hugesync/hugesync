@@ -88,56 +88,88 @@ pub async fn execute_plan(
                     "Delta sync"
                 );
 
-                // Get local path for delta upload
-                let local_path = match source {
-                    StorageBackend::Local(backend) => {
-                        backend.root().join(&path_str)
-                    }
-                    _ => {
-                        // For cloud-to-cloud, fall back to full upload
-                        tracing::warn!("Delta sync only supported from local source, falling back to full upload");
-                        match upload_file(source, dest, &path_str, action.entry.size, progress).await {
-                            Ok(bytes) => {
+                // Dispatch based on source/dest types
+                match (source, dest) {
+                    // Local → Cloud: delta upload
+                    (StorageBackend::Local(local_backend), _) => {
+                        let local_path = local_backend.root().join(&path_str);
+
+                        match super::delta_upload::delta_upload(&local_path, &path_str, dest, config).await {
+                            Ok(result) => {
                                 stats.files_delta += 1;
-                                stats.bytes_transferred += bytes;
+                                stats.bytes_transferred += result.bytes_transferred;
+                                stats.bytes_saved += result.bytes_reused;
+                                tracing::info!(
+                                    path = %path_str,
+                                    transferred = result.bytes_transferred,
+                                    reused = result.bytes_reused,
+                                    "Delta upload complete"
+                                );
                                 progress.finish_file();
                             }
                             Err(e) => {
-                                tracing::error!(path = %path_str, error = %e, "Upload failed");
-                                stats.errors += 1;
+                                tracing::error!(path = %path_str, error = %e, "Delta upload failed, falling back to full upload");
+                                match upload_file(source, dest, &path_str, action.entry.size, progress).await {
+                                    Ok(bytes) => {
+                                        stats.files_uploaded += 1;
+                                        stats.bytes_transferred += bytes;
+                                        progress.finish_file();
+                                    }
+                                    Err(e2) => {
+                                        tracing::error!(path = %path_str, error = %e2, "Full upload also failed");
+                                        stats.errors += 1;
+                                    }
+                                }
                             }
                         }
-                        continue;
                     }
-                };
 
-                // Perform delta upload
-                match super::delta_upload::delta_upload(&local_path, &path_str, dest, config).await {
-                    Ok(result) => {
-                        stats.files_delta += 1;
-                        stats.bytes_transferred += result.bytes_transferred;
-                        stats.bytes_saved += result.bytes_reused;
-                        tracing::info!(
-                            path = %path_str,
-                            transferred = result.bytes_transferred,
-                            reused = result.bytes_reused,
-                            parts_uploaded = result.parts_uploaded,
-                            parts_copied = result.parts_copied,
-                            "Delta sync complete"
-                        );
-                        progress.finish_file();
+                    // Cloud → Local: delta download
+                    (_, StorageBackend::Local(local_backend)) => {
+                        let local_path = local_backend.root().join(&path_str);
+
+                        match super::delta_download::delta_download(source, &local_path, &path_str, config).await {
+                            Ok(result) => {
+                                stats.files_delta += 1;
+                                stats.bytes_transferred += result.bytes_downloaded;
+                                stats.bytes_saved += result.bytes_reused;
+                                tracing::info!(
+                                    path = %path_str,
+                                    downloaded = result.bytes_downloaded,
+                                    reused = result.bytes_reused,
+                                    range_requests = result.range_requests,
+                                    "Delta download complete"
+                                );
+                                progress.finish_file();
+                            }
+                            Err(e) => {
+                                tracing::error!(path = %path_str, error = %e, "Delta download failed, falling back to full download");
+                                match download_file(source, dest, &path_str, action.entry.size, progress).await {
+                                    Ok(bytes) => {
+                                        stats.files_downloaded += 1;
+                                        stats.bytes_transferred += bytes;
+                                        progress.finish_file();
+                                    }
+                                    Err(e2) => {
+                                        tracing::error!(path = %path_str, error = %e2, "Full download also failed");
+                                        stats.errors += 1;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(path = %path_str, error = %e, "Delta sync failed, falling back to full upload");
-                        // Fall back to full upload on delta failure
+
+                    // Cloud → Cloud: fall back to full transfer
+                    _ => {
+                        tracing::warn!("Delta sync not supported for cloud-to-cloud, falling back to full transfer");
                         match upload_file(source, dest, &path_str, action.entry.size, progress).await {
                             Ok(bytes) => {
                                 stats.files_uploaded += 1;
                                 stats.bytes_transferred += bytes;
                                 progress.finish_file();
                             }
-                            Err(e2) => {
-                                tracing::error!(path = %path_str, error = %e2, "Full upload also failed");
+                            Err(e) => {
+                                tracing::error!(path = %path_str, error = %e, "Full transfer failed");
                                 stats.errors += 1;
                             }
                         }
