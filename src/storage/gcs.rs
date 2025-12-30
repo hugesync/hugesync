@@ -133,7 +133,7 @@ impl GcsBackend {
 
     /// Read a file as a stream of chunks (memory-efficient for large files)
     pub async fn get_stream(&self, path: &str) -> Result<ByteStream> {
-        use futures::stream;
+        use futures::channel::mpsc;
 
         let key = self.resolve_key(path);
 
@@ -141,18 +141,24 @@ impl GcsBackend {
             message: format!("Failed to download object: {}", e),
         })?;
 
-        // Collect chunks from object_store stream and create our stream
-        let mut chunks = Vec::new();
+        // Use a channel to bridge the non-Sync object_store stream to our Sync ByteStream
+        // This spawns a task to forward chunks, maintaining on-demand streaming
+        let (mut tx, rx) = mpsc::channel::<Result<Bytes>>(2);
+
         let mut obj_stream = result.into_stream();
+        tokio::spawn(async move {
+            use futures::SinkExt;
+            while let Some(chunk) = obj_stream.next().await {
+                let result = chunk.map_err(|e| Error::Gcs {
+                    message: format!("Failed to read object stream: {}", e),
+                });
+                if tx.send(result).await.is_err() {
+                    break; // Receiver dropped
+                }
+            }
+        });
 
-        while let Some(chunk) = obj_stream.next().await {
-            let bytes = chunk.map_err(|e| Error::Gcs {
-                message: format!("Failed to read object stream: {}", e),
-            })?;
-            chunks.push(bytes);
-        }
-
-        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        Ok(Box::pin(rx))
     }
 
     /// Read a range of bytes from a file

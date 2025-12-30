@@ -161,7 +161,7 @@ impl S3Backend {
 
     /// Read a file as a stream of chunks (memory-efficient for large files)
     pub async fn get_stream(&self, path: &str) -> Result<ByteStream> {
-        use futures::stream;
+        use tokio_util::io::ReaderStream;
 
         let key = self.resolve_key(path);
 
@@ -176,19 +176,18 @@ impl S3Backend {
                 message: e.to_string(),
             })?;
 
-        // Collect chunks from AWS ByteStream and create our stream
-        // AWS ByteStream yields Result<Bytes, ByteStreamError>
-        let mut chunks = Vec::new();
-        let mut body = output.body;
+        // Convert AWS ByteStream to AsyncRead, then wrap in ReaderStream
+        // This avoids buffering the entire file into memory
+        let async_read = output.body.into_async_read();
+        let stream = ReaderStream::new(async_read).map(|result| {
+            result
+                .map(|bytes| bytes.into())
+                .map_err(|e| Error::Aws {
+                    message: format!("Error reading S3 stream: {}", e),
+                })
+        });
 
-        while let Some(chunk) = body.next().await {
-            let bytes = chunk.map_err(|e| Error::Aws {
-                message: format!("Error reading S3 stream: {}", e),
-            })?;
-            chunks.push(bytes);
-        }
-
-        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        Ok(Box::pin(stream))
     }
 
     /// Read a range of bytes from a file

@@ -138,26 +138,28 @@ impl LocalBackend {
     ///
     /// Uses memory-mapping with file locking to avoid loading the entire file into RAM
     /// and prevent SIGBUS if the file is modified during read.
-    /// Yields chunks of 16MB at a time.
+    /// Yields chunks of 16MB at a time, copied on-demand.
     pub fn get_stream(&self, path: &str) -> Result<ByteStream> {
+        use std::sync::Arc;
+
         const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB chunks
 
         let full_path = self.resolve(path);
         // Use LockedMmap for safe memory mapping with file locking
-        let mmap = LockedMmap::open(&full_path)?;
-
+        let mmap = Arc::new(LockedMmap::open(&full_path)?);
         let total_size = mmap.len();
 
-        // Create an iterator that yields chunks
-        let chunks: Vec<Bytes> = (0..total_size)
-            .step_by(CHUNK_SIZE)
-            .map(|offset| {
-                let end = std::cmp::min(offset + CHUNK_SIZE, total_size);
-                Bytes::copy_from_slice(&mmap[offset..end])
-            })
-            .collect();
+        // Use unfold to yield chunks on-demand, copying only one chunk at a time
+        let stream = stream::unfold((mmap, 0usize), move |(mmap, offset)| async move {
+            if offset >= total_size {
+                return None;
+            }
+            let end = std::cmp::min(offset + CHUNK_SIZE, total_size);
+            let chunk = Bytes::copy_from_slice(&mmap[offset..end]);
+            Some((Ok(chunk), (mmap, end)))
+        });
 
-        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        Ok(Box::pin(stream))
     }
 
     /// Read a range of bytes from a file

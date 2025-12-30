@@ -272,40 +272,50 @@ impl SshBackend {
             return Ok(Box::pin(stream::once(async { Ok(Bytes::from(data)) })));
         }
 
-        // For large files, read in chunks using seek/read
-        let mut file = conn.session.open(&remote_path).await.map_err(|e| Error::Ssh {
+        // For large files, open the file and stream chunks on-demand
+        let file = conn.session.open(&remote_path).await.map_err(|e| Error::Ssh {
             message: format!("Failed to open file {}: {}", remote_path, e),
         })?;
 
-        let mut chunks = Vec::new();
-        let mut offset = 0usize;
+        // Wrap file in Arc<Mutex> for shared ownership with stream
+        let file = Arc::new(tokio::sync::Mutex::new(file));
+        let remote_path_clone = remote_path.clone();
 
-        while offset < file_size {
-            let to_read = std::cmp::min(CHUNK_SIZE, file_size - offset);
-            let mut buf = BytesMut::zeroed(to_read);
-
-            // Seek to position
-            file.seek(std::io::SeekFrom::Start(offset as u64))
-                .await
-                .map_err(|e| Error::Ssh {
-                    message: format!("Failed to seek in file {}: {}", remote_path, e),
-                })?;
-
-            // Read chunk
-            let bytes_read = file.read_exact(&mut buf).await.map_err(|e| Error::Ssh {
-                message: format!("Failed to read chunk from {}: {}", remote_path, e),
-            });
-
-            match bytes_read {
-                Ok(_) => {
-                    chunks.push(buf.freeze());
-                    offset += to_read;
+        // Use unfold to yield chunks on-demand
+        let stream = stream::unfold(
+            (file, 0usize, file_size, remote_path_clone),
+            move |(file, offset, total_size, path)| async move {
+                if offset >= total_size {
+                    return None;
                 }
-                Err(_) => break, // EOF or error
-            }
-        }
 
-        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+                let to_read = std::cmp::min(CHUNK_SIZE, total_size - offset);
+                let mut buf = BytesMut::zeroed(to_read);
+
+                let mut file_guard = file.lock().await;
+
+                // Seek to position
+                if let Err(e) = file_guard.seek(std::io::SeekFrom::Start(offset as u64)).await {
+                    return Some((
+                        Err(Error::Ssh {
+                            message: format!("Failed to seek in file {}: {}", path, e),
+                        }),
+                        (file.clone(), total_size, total_size, path), // Force end
+                    ));
+                }
+
+                // Read chunk
+                match file_guard.read_exact(&mut buf).await {
+                    Ok(_) => {
+                        drop(file_guard);
+                        Some((Ok(buf.freeze()), (file, offset + to_read, total_size, path)))
+                    }
+                    Err(_) => None, // EOF or error
+                }
+            },
+        );
+
+        Ok(Box::pin(stream))
     }
 
     /// Read a range of bytes from a file
