@@ -1,8 +1,8 @@
 //! .hssig file format reading and writing
 //!
-//! Format (v2):
+//! Format:
 //! - Magic: 6 bytes "HSSIG\x01"
-//! - Version: 1 byte (currently 2)
+//! - Version: 1 byte
 //! - Length: 8 bytes (little-endian u64, compressed data size)
 //! - Data: zstd-compressed bitcode
 
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_invalid_magic() {
-        let data = b"BADMAG\x02";
+        let data = b"BADMAG\x01";
         let result = read_signature_from_bytes(data);
         assert!(result.is_err());
     }

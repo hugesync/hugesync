@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 /// Magic bytes for .hssig files
 pub const SIGNATURE_MAGIC: &[u8; 6] = b"HSSIG\x01";
 
-/// Current signature format version (v2 = bitcode + zstd)
-pub const SIGNATURE_VERSION: u8 = 2;
+/// Current signature format version
+pub const SIGNATURE_VERSION: u8 = 1;
 
 /// A file signature containing block checksums
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
