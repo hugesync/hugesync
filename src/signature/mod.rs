@@ -6,16 +6,17 @@ pub mod generate;
 pub use file::{read_signature, read_signature_from_bytes, write_signature, write_signature_to_bytes};
 pub use generate::{generate_signature, generate_signature_from_bytes};
 
+use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 /// Magic bytes for .hssig files
 pub const SIGNATURE_MAGIC: &[u8; 6] = b"HSSIG\x01";
 
-/// Current signature format version
-pub const SIGNATURE_VERSION: u8 = 1;
+/// Current signature format version (v2 = bitcode + zstd)
+pub const SIGNATURE_VERSION: u8 = 2;
 
 /// A file signature containing block checksums
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct Signature {
     /// Version of the signature format
     pub version: u8,
@@ -60,7 +61,7 @@ impl Signature {
 }
 
 /// Checksum for a single block
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct BlockChecksum {
     /// Block index (0-based)
     pub index: usize,

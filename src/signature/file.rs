@@ -1,10 +1,19 @@
 //! .hssig file format reading and writing
+//!
+//! Format (v2):
+//! - Magic: 6 bytes "HSSIG\x01"
+//! - Version: 1 byte (currently 2)
+//! - Length: 8 bytes (little-endian u64, compressed data size)
+//! - Data: zstd-compressed bitcode
 
 use super::{Signature, SIGNATURE_MAGIC, SIGNATURE_VERSION};
 use crate::error::{Error, Result};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
+
+/// Zstd compression level (3 is a good balance of speed and ratio)
+const COMPRESSION_LEVEL: i32 = 3;
 
 /// Write a signature to a file
 pub fn write_signature(sig: &Signature, path: &Path) -> Result<()> {
@@ -19,18 +28,18 @@ pub fn write_signature(sig: &Signature, path: &Path) -> Result<()> {
         .write_all(&[SIGNATURE_VERSION])
         .map_err(|e| Error::io("writing version", e))?;
 
-    // Serialize to JSON (simple format, can optimize later)
-    let json = serde_json::to_vec(sig).map_err(|e| Error::Delta {
-        message: format!("serializing signature: {}", e),
-    })?;
+    // Serialize with bitcode and compress with zstd
+    let encoded = bitcode::encode(sig);
+    let compressed = zstd::encode_all(encoded.as_slice(), COMPRESSION_LEVEL)
+        .map_err(|e| Error::io("compressing signature", e))?;
 
     // Write length then data
-    let len = json.len() as u64;
+    let len = compressed.len() as u64;
     writer
         .write_all(&len.to_le_bytes())
         .map_err(|e| Error::io("writing length", e))?;
     writer
-        .write_all(&json)
+        .write_all(&compressed)
         .map_err(|e| Error::io("writing data", e))?;
 
     writer.flush().map_err(|e| Error::io("flushing", e))?;
@@ -38,7 +47,7 @@ pub fn write_signature(sig: &Signature, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Maximum signature data size to prevent DoS (100MB)
+/// Maximum signature data size to prevent DoS (100MB compressed)
 const MAX_SIGNATURE_SIZE: usize = 100 * 1024 * 1024;
 
 /// Read a signature from a file
@@ -90,14 +99,17 @@ pub fn read_signature(path: &Path) -> Result<Signature> {
         });
     }
 
-    // Read data
-    let mut data = vec![0u8; len];
+    // Read compressed data
+    let mut compressed = vec![0u8; len];
     reader
-        .read_exact(&mut data)
+        .read_exact(&mut compressed)
         .map_err(|e| Error::io("reading data", e))?;
 
-    // Deserialize
-    let sig: Signature = serde_json::from_slice(&data).map_err(|e| Error::Delta {
+    // Decompress and deserialize
+    let decompressed = zstd::decode_all(compressed.as_slice())
+        .map_err(|e| Error::io("decompressing signature", e))?;
+
+    let sig: Signature = bitcode::decode(&decompressed).map_err(|e| Error::Delta {
         message: format!("deserializing signature: {}", e),
     })?;
 
@@ -148,8 +160,12 @@ pub fn read_signature_from_bytes(data: &[u8]) -> Result<Signature> {
         });
     }
 
-    // Deserialize
-    let sig: Signature = serde_json::from_slice(&data[15..15 + len]).map_err(|e| Error::Delta {
+    // Decompress and deserialize
+    let compressed = &data[15..15 + len];
+    let decompressed = zstd::decode_all(compressed)
+        .map_err(|e| Error::io("decompressing signature", e))?;
+
+    let sig: Signature = bitcode::decode(&decompressed).map_err(|e| Error::Delta {
         message: format!("deserializing signature: {}", e),
     })?;
 
@@ -158,16 +174,17 @@ pub fn read_signature_from_bytes(data: &[u8]) -> Result<Signature> {
 
 /// Write a signature to bytes
 pub fn write_signature_to_bytes(sig: &Signature) -> Result<Vec<u8>> {
-    let json = serde_json::to_vec(sig).map_err(|e| Error::Delta {
-        message: format!("serializing signature: {}", e),
-    })?;
+    // Serialize with bitcode and compress with zstd
+    let encoded = bitcode::encode(sig);
+    let compressed = zstd::encode_all(encoded.as_slice(), COMPRESSION_LEVEL)
+        .map_err(|e| Error::io("compressing signature", e))?;
 
-    let len = json.len() as u64;
-    let mut data = Vec::with_capacity(7 + 8 + json.len());
+    let len = compressed.len() as u64;
+    let mut data = Vec::with_capacity(7 + 8 + compressed.len());
     data.extend_from_slice(SIGNATURE_MAGIC);
     data.push(SIGNATURE_VERSION);
     data.extend_from_slice(&len.to_le_bytes());
-    data.extend_from_slice(&json);
+    data.extend_from_slice(&compressed);
 
     Ok(data)
 }
@@ -204,8 +221,27 @@ mod tests {
 
     #[test]
     fn test_invalid_magic() {
-        let data = b"BADMAG\x01";
+        let data = b"BADMAG\x02";
         let result = read_signature_from_bytes(data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compression_reduces_size() {
+        // Generate a larger signature to test compression
+        let large_data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let sig = generate_signature_from_bytes(&large_data, 1024);
+
+        let bytes = write_signature_to_bytes(&sig).unwrap();
+        let encoded_uncompressed = bitcode::encode(&sig);
+
+        // Compressed should be smaller than uncompressed
+        // (subtract header size for fair comparison)
+        assert!(
+            bytes.len() - 15 < encoded_uncompressed.len(),
+            "compressed {} vs uncompressed {}",
+            bytes.len() - 15,
+            encoded_uncompressed.len()
+        );
     }
 }

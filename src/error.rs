@@ -130,10 +130,3 @@ impl From<toml::de::Error> for Error {
     }
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(err: serde_json::Error) -> Self {
-        Self::Config {
-            message: format!("JSON error: {}", err),
-        }
-    }
-}
